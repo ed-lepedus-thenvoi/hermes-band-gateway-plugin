@@ -420,6 +420,26 @@ class BandAdapter(BasePlatformAdapter):
             if handle and handle not in mentions:
                 mentions.append(handle)
 
+        # Strip self-mentions: Band rejects send_message with
+        # 422 'cannot_mention_self' if the sending agent appears in the
+        # mentions payload. The LLM tends to echo back ``@[[<our-uuid>]]``
+        # or its own @handle when quoting the inbound message, so this
+        # is a hot path. We dedupe by participant ID (the source of
+        # truth) and rebuild the handle set without our own entry.
+        self_handles: set = set()
+        for p in participants:
+            pid = p.get("id") if isinstance(p, dict) else getattr(p, "id", None)
+            if pid and str(pid) == str(self.agent_id):
+                raw = (
+                    p.get("handle") if isinstance(p, dict)
+                    else getattr(p, "handle", None)
+                )
+                normalized = _normalize_handle(raw)
+                if normalized:
+                    self_handles.add(normalized)
+        if self_handles:
+            mentions = [m for m in mentions if m not in self_handles]
+
         if not mentions:
             return SendResult(
                 success=False,

@@ -594,6 +594,95 @@ class TestBandAdapterSend:
         assert "@ed01/testtestmes" in mentions
 
     @pytest.mark.asyncio
+    async def test_send_filters_self_mention_via_handle(self, monkeypatch):
+        """Band rejects send_message with 422 'cannot_mention_self' if the
+        sending agent is in the mentions list. If the LLM writes its own
+        @handle in the reply (which happens when it echoes the inbound
+        message), the resolver should drop it before posting.
+        """
+        adapter = self._adapter()  # agent_id = "agent-self"
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._room_participants["room-1"] = [
+            {"id": "agent-self", "handle": "ed01/myself", "type": "Agent"},
+            {"id": "u-ed", "handle": "ed", "type": "User"},
+        ]
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        await adapter.send("room-1", "Thanks @ed01/myself for asking — here's my answer.")
+
+        mentions = fake_tools_instance.send_message.await_args.kwargs["mentions"]
+        assert "@ed01/myself" not in mentions
+        assert "@ed" in mentions  # the real recipient survives
+
+    @pytest.mark.asyncio
+    async def test_send_filters_self_mention_via_wire_format(self, monkeypatch):
+        """Same bug, different shape: the LLM echoes the inbound
+        ``@[[<our-uuid>]]`` wire format. The resolver finds the self
+        participant by ID and adds the handle — which then needs to be
+        filtered before send.
+        """
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._room_participants["room-1"] = [
+            {"id": "agent-self", "handle": "ed01/myself", "type": "Agent"},
+            {"id": "u-ed", "handle": "ed", "type": "User"},
+        ]
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        await adapter.send("room-1", "@[[agent-self]] noted, thanks!")
+
+        mentions = fake_tools_instance.send_message.await_args.kwargs["mentions"]
+        assert "@ed01/myself" not in mentions
+        assert "@ed" in mentions
+
+    @pytest.mark.asyncio
+    async def test_send_fails_when_only_self_mention_resolvable(self, monkeypatch):
+        """If the LLM ONLY references itself and there's no other addressee
+        cached, filtering self leaves an empty mentions list — surface the
+        clear error message rather than letting Band reject the request."""
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        # No last_sender; only self in the participant cache.
+        adapter._room_participants["room-1"] = [
+            {"id": "agent-self", "handle": "ed01/myself", "type": "Agent"},
+        ]
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        result = await adapter.send("room-1", "@ed01/myself note to self.")
+        assert result.success is False
+        assert "no known recipients" in result.error
+        fake_tools_instance.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_send_ignores_unknown_at_handles(self, monkeypatch):
         """An @handle that doesn't match any participant is silently
         skipped — we shouldn't inject a fake mention that the API will
