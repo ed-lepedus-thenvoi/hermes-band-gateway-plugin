@@ -1,0 +1,46 @@
+name: band-platform
+label: Band
+kind: platform
+version: 0.1.0
+description: >
+  Band (formerly Thenvoi) gateway adapter for Hermes Agent.
+  Bridges Band chat rooms to the Hermes agent runner over the official
+  Band Python SDK (WebSocket + REST). Each inbound Band message becomes a
+  Hermes MessageEvent; Hermes replies are sent back into the originating
+  room via the SDK's send_message tool.
+author: Band.ai
+requires_env:
+  - name: BAND_AGENT_ID
+    description: "UUID of the external agent created on the Band platform (app.band.ai → Agents → Create New Agent → External)"
+    prompt: "Band agent ID (UUID)"
+    url: "https://app.band.ai/"
+    password: false
+  - name: BAND_API_KEY
+    description: "API key shown once when the external agent is created. Treat like a password."
+    prompt: "Band API key"
+    password: true
+optional_env:
+  - name: BAND_REST_URL
+    description: "Band REST URL (defaults to https://app.band.ai — only override for self-hosted / staging)"
+    prompt: "Band REST URL"
+    password: false
+  - name: BAND_WS_URL
+    description: "Band WebSocket URL (defaults to wss://app.band.ai/api/v1/socket/websocket)"
+    prompt: "Band WebSocket URL"
+    password: false
+  - name: BAND_HOME_CHANNEL
+    description: "Default room ID for cron / notification delivery (deliver=band)"
+    prompt: "Home room ID (UUID)"
+    password: false
+  - name: BAND_HOME_CHANNEL_NAME
+    description: "Friendly label for the home room (shown in hermes status)"
+    prompt: "Home room name"
+    password: false
+  - name: BAND_ALLOWED_USERS
+    description: "Comma-separated Band user handles allowed to talk to the bot (e.g. @alice,@bob). Empty = deny all unless BAND_ALLOW_ALL_USERS=true."
+    prompt: "Allowed handles (comma-separated)"
+    password: false
+  - name: BAND_ALLOW_ALL_USERS
+    description: "Allow every participant in any room the agent joins (dev only — costs LLM tokens)"
+    prompt: "Allow all users? (true/false)"
+    password: false
