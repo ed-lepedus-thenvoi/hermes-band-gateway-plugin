@@ -35,6 +35,12 @@ register = _band_mod.register
 _standalone_send = _band_mod._standalone_send
 
 
+# Tool handlers — added incrementally via TDD. Bound lazily so individual
+# tests can xfail cleanly while a tool is still RED.
+def _tool(name: str):
+    return getattr(_band_mod, name, None)
+
+
 # ── Test fixtures ────────────────────────────────────────────────────────
 
 
@@ -527,6 +533,94 @@ class TestBandAdapterSend:
         )
 
     @pytest.mark.asyncio
+    async def test_send_resolves_at_handle_mentions_from_text(self, monkeypatch):
+        """When the LLM writes '@testtestmes please help' in the reply,
+        testtestmes should end up in the structured mentions payload so
+        Band actually notifies them — not just left as literal text."""
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._room_participants["room-1"] = [
+            {"id": "u-ed", "handle": "ed", "type": "User"},
+            {"id": "a-tt", "handle": "ed01/testtestmes", "type": "Agent"},
+        ]
+
+        sent = MagicMock(id="msg-1")
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=sent)
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        result = await adapter.send(
+            "room-1", "@ed01/testtestmes please weigh in here.",
+        )
+        assert result.success is True
+        mentions = fake_tools_instance.send_message.await_args.kwargs["mentions"]
+        # Order doesn't matter; both the in-text mention AND the last sender
+        # (the user who asked) should be addressable so they all get notified.
+        assert set(mentions) == {"@ed01/testtestmes", "@ed"}
+
+    @pytest.mark.asyncio
+    async def test_send_resolves_band_wire_format_mentions(self, monkeypatch):
+        """Band's wire format ``@[[uuid]]`` sometimes leaks into LLM replies
+        because it appears in the inbound text we forward. The adapter
+        should still resolve those to handles so the mention payload is
+        clean."""
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._room_participants["room-1"] = [
+            {"id": "u-ed", "handle": "ed", "type": "User"},
+            {"id": "a-tt", "handle": "ed01/testtestmes", "type": "Agent"},
+        ]
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        await adapter.send("room-1", "Hey @[[a-tt]], can you help?")
+        mentions = fake_tools_instance.send_message.await_args.kwargs["mentions"]
+        assert "@ed01/testtestmes" in mentions
+
+    @pytest.mark.asyncio
+    async def test_send_ignores_unknown_at_handles(self, monkeypatch):
+        """An @handle that doesn't match any participant is silently
+        skipped — we shouldn't inject a fake mention that the API will
+        reject. The default last-sender mention should still get through."""
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._room_participants["room-1"] = [
+            {"id": "u-ed", "handle": "ed", "type": "User"},
+        ]
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        result = await adapter.send("room-1", "Sorry @ghost, I don't know who that is.")
+        assert result.success is True
+        mentions = fake_tools_instance.send_message.await_args.kwargs["mentions"]
+        assert mentions == ["@ed"]  # ghost dropped, last sender retained
+
+    @pytest.mark.asyncio
     async def test_send_surfaces_sdk_error_as_send_failure(self, monkeypatch):
         adapter = self._adapter()
         adapter._mark_connected()
@@ -737,3 +831,310 @@ class TestStandaloneSend:
         mention_ids = {m["id"] for m in msg.mentions}
         assert "agent-self" not in mention_ids
         assert "other-bot" not in mention_ids
+
+
+# ── Platform tools (Band-native operations exposed to the Hermes LLM) ────
+#
+# These tools let an agent enumerate peers, see who's in the current room,
+# and invite/remove participants. They wrap the same REST methods the SDK
+# uses internally but route through Hermes' tool-call dispatcher.
+
+
+import json
+from types import SimpleNamespace
+
+
+def _peer(id, handle, type="User", name=None):
+    """Build a Fern-shaped peer/participant. SimpleNamespace avoids the
+    MagicMock(name=…) trap (where ``name`` sets the mock's display label
+    instead of the attribute).
+    """
+    return SimpleNamespace(id=id, handle=handle, name=name or handle, type=type)
+
+
+@pytest.fixture
+def live_band(monkeypatch):
+    """Patch ``_get_live_adapter`` to return a fake BandAdapter with a
+    captured REST client. Returns ``(adapter, rest)`` so the test can
+    seed state and assert REST calls.
+
+    Also stubs ``thenvoi.client.rest`` symbols the tool handlers import
+    (``DEFAULT_REQUEST_OPTIONS``, ``ParticipantRequest``) so the host
+    test venv doesn't need band-sdk installed.
+    """
+    rest = MagicMock()
+
+    fake_adapter = BandAdapter(_make_config(agent_id="agent-self", api_key="b"))
+    fake_adapter._mark_connected()
+    fake_adapter._agent = MagicMock()
+    fake_adapter._agent.runtime.link.rest = rest
+
+    monkeypatch.setattr(_band_mod, "_get_live_adapter", lambda: fake_adapter)
+
+    # Stub the SDK's REST client module so handler-time imports succeed.
+    fake_rest_module = MagicMock(
+        DEFAULT_REQUEST_OPTIONS={"max_retries": 3},
+        ParticipantRequest=lambda participant_id, role: SimpleNamespace(
+            participant_id=participant_id, role=role,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "thenvoi.client.rest", fake_rest_module)
+    return fake_adapter, rest
+
+
+class TestBandGetParticipantsTool:
+
+    @pytest.mark.asyncio
+    async def test_returns_participants_from_current_room(self, live_band):
+        adapter, rest = live_band
+        adapter._room_last_sender["room-1"] = {"id": "u1", "handle": "@alice"}
+
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[
+                _peer("agent-self", "self", "Agent", "Self"),
+                _peer("u1", "alice", "User", "Alice"),
+            ])
+        )
+
+        handler = _tool("band_get_participants_handler")
+        assert handler is not None, "band_get_participants_handler not registered"
+
+        result = json.loads(await handler({}))
+        assert "error" not in result, result
+        handles = {p["handle"] for p in result["participants"]}
+        assert handles == {"@self", "@alice"}
+        rest.agent_api_participants.list_agent_chat_participants.assert_awaited_once()
+        kwargs = rest.agent_api_participants.list_agent_chat_participants.await_args.kwargs
+        assert kwargs["chat_id"] == "room-1"
+
+    @pytest.mark.asyncio
+    async def test_returns_error_when_no_live_adapter(self, monkeypatch):
+        monkeypatch.setattr(_band_mod, "_get_live_adapter", lambda: None)
+        handler = _tool("band_get_participants_handler")
+        result = json.loads(await handler({}))
+        assert "error" in result
+        assert "not running" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_returns_error_when_no_chat_id_available(self, live_band):
+        # live_band fixture doesn't seed _room_last_sender, and no chat_id
+        # is passed — handler must fail clean rather than crash or guess.
+        handler = _tool("band_get_participants_handler")
+        result = json.loads(await handler({}))
+        assert "error" in result
+        assert "chat_id" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_chat_id_overrides_cached_room(self, live_band):
+        adapter, rest = live_band
+        adapter._room_last_sender["room-from-cache"] = {"id": "u1", "handle": "@a"}
+
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[])
+        )
+
+        handler = _tool("band_get_participants_handler")
+        json.loads(await handler({"chat_id": "room-explicit"}))
+
+        kwargs = rest.agent_api_participants.list_agent_chat_participants.await_args.kwargs
+        assert kwargs["chat_id"] == "room-explicit"
+
+
+class TestBandLookupPeersTool:
+
+    @pytest.mark.asyncio
+    async def test_returns_peers_with_default_pagination(self, live_band):
+        _adapter, rest = live_band
+        rest.agent_api_peers.list_agent_peers = AsyncMock(
+            return_value=SimpleNamespace(data=[
+                _peer("u-bob", "bob", "User", "Bob"),
+                _peer("a-weather", "weatherbot", "Agent", "Weather Bot"),
+            ])
+        )
+
+        handler = _tool("band_lookup_peers_handler")
+        assert handler is not None, "band_lookup_peers_handler not registered"
+
+        result = json.loads(await handler({}))
+        assert "error" not in result, result
+        handles = {p["handle"] for p in result["peers"]}
+        assert handles == {"@bob", "@weatherbot"}
+
+        rest.agent_api_peers.list_agent_peers.assert_awaited_once()
+        kwargs = rest.agent_api_peers.list_agent_peers.await_args.kwargs
+        # Default page sizing is the SDK's responsibility — we just don't
+        # constrain it by default.
+        assert kwargs.get("page", 1) == 1
+
+    @pytest.mark.asyncio
+    async def test_passes_through_pagination_args(self, live_band):
+        _adapter, rest = live_band
+        rest.agent_api_peers.list_agent_peers = AsyncMock(
+            return_value=SimpleNamespace(data=[])
+        )
+
+        handler = _tool("band_lookup_peers_handler")
+        await handler({"page": 2, "page_size": 25})
+
+        kwargs = rest.agent_api_peers.list_agent_peers.await_args.kwargs
+        assert kwargs["page"] == 2
+        assert kwargs["page_size"] == 25
+
+    @pytest.mark.asyncio
+    async def test_returns_error_when_no_live_adapter(self, monkeypatch):
+        monkeypatch.setattr(_band_mod, "_get_live_adapter", lambda: None)
+        handler = _tool("band_lookup_peers_handler")
+        result = json.loads(await handler({}))
+        assert "error" in result and "not running" in result["error"]
+
+
+class TestBandAddParticipantTool:
+
+    @pytest.mark.asyncio
+    async def test_adds_participant_by_id_to_current_room(self, live_band):
+        adapter, rest = live_band
+        adapter._room_last_sender["room-1"] = {"id": "u1", "handle": "@alice"}
+
+        rest.agent_api_participants.add_agent_chat_participant = AsyncMock(
+            return_value=SimpleNamespace(data=_peer("a-helper", "helper", "Agent"))
+        )
+
+        handler = _tool("band_add_participant_handler")
+        assert handler is not None, "band_add_participant_handler not registered"
+
+        result = json.loads(await handler({"identifier": "a-helper"}))
+        assert "error" not in result, result
+        assert result["added"]["id"] == "a-helper"
+        assert result["added"]["handle"] == "@helper"
+
+        rest.agent_api_participants.add_agent_chat_participant.assert_awaited_once()
+        kwargs = rest.agent_api_participants.add_agent_chat_participant.await_args.kwargs
+        assert kwargs["chat_id"] == "room-1"
+        # The participant payload should carry the participant_id and a role.
+        participant = kwargs["participant"]
+        assert participant.participant_id == "a-helper"
+        assert participant.role == "member"
+
+    @pytest.mark.asyncio
+    async def test_role_argument_is_respected(self, live_band):
+        adapter, rest = live_band
+        adapter._room_last_sender["room-1"] = {"id": "u1", "handle": "@a"}
+        rest.agent_api_participants.add_agent_chat_participant = AsyncMock(
+            return_value=SimpleNamespace(data=_peer("a-helper", "helper", "Agent"))
+        )
+
+        handler = _tool("band_add_participant_handler")
+        await handler({"identifier": "a-helper", "role": "admin"})
+
+        kwargs = rest.agent_api_participants.add_agent_chat_participant.await_args.kwargs
+        assert kwargs["participant"].role == "admin"
+
+    @pytest.mark.asyncio
+    async def test_requires_identifier(self, live_band):
+        handler = _tool("band_add_participant_handler")
+        result = json.loads(await handler({}))
+        assert "error" in result
+        assert "identifier" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_surfaces_rest_failures(self, live_band):
+        adapter, rest = live_band
+        adapter._room_last_sender["room-1"] = {"id": "u1", "handle": "@a"}
+        rest.agent_api_participants.add_agent_chat_participant = AsyncMock(
+            side_effect=RuntimeError("already a participant"),
+        )
+
+        handler = _tool("band_add_participant_handler")
+        result = json.loads(await handler({"identifier": "a-helper"}))
+        assert "error" in result
+        assert "already a participant" in result["error"]
+
+
+class TestBandRemoveParticipantTool:
+
+    @pytest.mark.asyncio
+    async def test_removes_participant_from_current_room(self, live_band):
+        adapter, rest = live_band
+        adapter._room_last_sender["room-1"] = {"id": "u1", "handle": "@a"}
+
+        rest.agent_api_participants.remove_agent_chat_participant = AsyncMock(
+            return_value=SimpleNamespace(data=None)
+        )
+
+        handler = _tool("band_remove_participant_handler")
+        assert handler is not None, "band_remove_participant_handler not registered"
+
+        result = json.loads(await handler({"identifier": "u-evicted"}))
+        assert "error" not in result, result
+        assert result["removed"]["id"] == "u-evicted"
+        assert result["chat_id"] == "room-1"
+
+        rest.agent_api_participants.remove_agent_chat_participant.assert_awaited_once()
+        kwargs = rest.agent_api_participants.remove_agent_chat_participant.await_args.kwargs
+        assert kwargs["chat_id"] == "room-1"
+        assert kwargs["participant_id"] == "u-evicted"
+
+    @pytest.mark.asyncio
+    async def test_requires_identifier(self, live_band):
+        handler = _tool("band_remove_participant_handler")
+        result = json.loads(await handler({}))
+        assert "error" in result and "identifier" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_surfaces_rest_failures(self, live_band):
+        adapter, rest = live_band
+        adapter._room_last_sender["room-1"] = {"id": "u1", "handle": "@a"}
+        rest.agent_api_participants.remove_agent_chat_participant = AsyncMock(
+            side_effect=RuntimeError("not a participant"),
+        )
+
+        handler = _tool("band_remove_participant_handler")
+        result = json.loads(await handler({"identifier": "u-evicted"}))
+        assert "error" in result and "not a participant" in result["error"]
+
+
+class TestRegisterToolsWiring:
+    """register() should call ctx.register_tool for each of the 4 tools."""
+
+    def test_register_wires_all_four_tools(self):
+        ctx = MagicMock()
+        register(ctx)
+        names = [
+            call.kwargs.get("name") or call.args[0]
+            for call in ctx.register_tool.call_args_list
+        ]
+        assert set(names) == {
+            "band_get_participants",
+            "band_lookup_peers",
+            "band_add_participant",
+            "band_remove_participant",
+        }
+
+    def test_tools_share_one_toolset(self):
+        ctx = MagicMock()
+        register(ctx)
+        toolsets = {
+            call.kwargs.get("toolset") for call in ctx.register_tool.call_args_list
+        }
+        assert toolsets == {"hermes-band"}
+
+    def test_tools_declare_band_creds_as_required_env(self):
+        ctx = MagicMock()
+        register(ctx)
+        for call in ctx.register_tool.call_args_list:
+            assert call.kwargs.get("requires_env") == ["BAND_AGENT_ID", "BAND_API_KEY"]
+
+    def test_tools_register_as_async(self):
+        # All handlers are coroutines — without is_async=True the registry
+        # would call them sync and the LLM would see a stringified coroutine.
+        ctx = MagicMock()
+        register(ctx)
+        for call in ctx.register_tool.call_args_list:
+            assert call.kwargs.get("is_async") is True
+
+    def test_register_survives_ctx_without_register_tool(self):
+        # Some test/stub ctxs don't have register_tool. Platform registration
+        # must still succeed — _register_band_tools should be a no-op then.
+        ctx = MagicMock(spec=["register_platform"])
+        register(ctx)  # must not raise
+        ctx.register_platform.assert_called_once()

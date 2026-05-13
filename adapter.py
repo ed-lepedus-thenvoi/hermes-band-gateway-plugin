@@ -41,6 +41,7 @@ import asyncio
 import datetime as _dt
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -346,7 +347,21 @@ class BandAdapter(BasePlatformAdapter):
         participants = self._room_participants.get(chat_id) or []
         tools = AgentTools(chat_id, rest, participants=participants)
 
-        mentions = self._resolve_default_mentions(chat_id, participants)
+        # Mention resolution layers, in priority order:
+        #   1. Handles the LLM @-mentioned (or echoed via @[[uuid]] wire
+        #      format) in the reply body — these are the explicit
+        #      addressees so Band actually notifies them.
+        #   2. The last sender in the room, so the user/agent who asked
+        #      always gets the reply even if the LLM forgot to name them.
+        # Band's API requires ≥1 mention; combining both layers gives the
+        # most reliable delivery for both 1:1 and agent-to-agent flows.
+        text_mentions = self._extract_text_mentions(content, participants)
+        default_mentions = self._resolve_default_mentions(chat_id, participants)
+        mentions: List[str] = []
+        for handle in (*text_mentions, *default_mentions):
+            if handle and handle not in mentions:
+                mentions.append(handle)
+
         if not mentions:
             return SendResult(
                 success=False,
@@ -367,6 +382,73 @@ class BandAdapter(BasePlatformAdapter):
         if response is not None:
             message_id = str(getattr(response, "id", "") or "")
         return SendResult(success=True, message_id=message_id or str(int(time.time() * 1000)))
+
+    # Band wire format: ``@[[<participant-id>]]``. The platform sends this
+    # in inbound message bodies and LLMs sometimes echo it back when quoting.
+    _MENTION_WIRE_RE = re.compile(r"@\[\[([^\]]+)\]\]")
+    # Plain ``@handle``. Handles permit ``/`` (agent suffix) and ``.`` / ``-``
+    # / ``_`` — same character class the SDK uses.
+    _MENTION_HANDLE_RE = re.compile(r"@([A-Za-z0-9_./-]+)")
+
+    def _extract_text_mentions(
+        self,
+        content: str,
+        participants: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Resolve ``@[[id]]`` and ``@handle`` references in ``content``
+        against the room's participant cache. Returns a deduped list of
+        normalized handles. Unknown references are silently skipped — the
+        API would reject them anyway.
+        """
+        if not content or not participants:
+            return []
+
+        # Index participants by both ID and normalized handle for O(1) lookup.
+        by_id: Dict[str, Dict[str, Any]] = {}
+        by_handle: Dict[str, Dict[str, Any]] = {}
+        for p in participants:
+            pid = (p.get("id") if isinstance(p, dict) else getattr(p, "id", None))
+            phandle = (
+                p.get("handle") if isinstance(p, dict) else getattr(p, "handle", None)
+            )
+            if pid:
+                by_id[str(pid)] = p
+            if phandle:
+                normalized = _normalize_handle(phandle)
+                if normalized:
+                    by_handle[normalized.lower()] = p
+
+        ordered_handles: List[str] = []
+        seen: set = set()
+
+        def _push(participant: Any) -> None:
+            raw_handle = (
+                participant.get("handle") if isinstance(participant, dict)
+                else getattr(participant, "handle", None)
+            )
+            handle = _normalize_handle(raw_handle) or raw_handle
+            if handle and handle not in seen:
+                ordered_handles.append(handle)
+                seen.add(handle)
+
+        # Wire-format matches first (consume them so the @ char doesn't also
+        # match the bare-handle regex on the inner ``[[...]]``).
+        stripped = content
+        for match in self._MENTION_WIRE_RE.finditer(content):
+            target_id = match.group(1).strip()
+            if target_id in by_id:
+                _push(by_id[target_id])
+        stripped = self._MENTION_WIRE_RE.sub(" ", content)
+
+        for match in self._MENTION_HANDLE_RE.finditer(stripped):
+            candidate = _normalize_handle(match.group(1))
+            if not candidate:
+                continue
+            participant = by_handle.get(candidate.lower())
+            if participant is not None:
+                _push(participant)
+
+        return ordered_handles
 
     def _resolve_default_mentions(
         self,
@@ -644,6 +726,367 @@ async def _standalone_send(
                 pass
 
 
+# --- Platform tools exposed to Hermes' LLM ---------------------------------
+#
+# These let an agent enumerate peers, see who's in the current room, and
+# invite / remove participants. Each tool wraps the same REST methods the
+# Band SDK uses internally, but is routed through Hermes' tool dispatcher
+# so the model can call them natively.
+#
+# Handler signature is the dispatcher's: ``handler(args: dict, **kwargs)``
+# returning a JSON-encoded string. ``kwargs`` carries ``task_id`` /
+# ``user_task`` and is currently ignored — chat scoping defaults to the
+# adapter's most-recently-active room and can be overridden by the LLM
+# passing ``chat_id``.
+
+import json as _json
+
+
+def _get_live_adapter() -> Optional["BandAdapter"]:
+    """Return the live ``BandAdapter`` from the running gateway, or ``None``.
+
+    Mirrors ``tools/send_message_tool._send_via_adapter``'s pattern: the
+    gateway runner stashes itself as a weakref so out-of-process tools
+    can fail cleanly when the adapter isn't reachable.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref  # type: ignore
+    except Exception:
+        return None
+    runner = _gateway_runner_ref()
+    if runner is None:
+        return None
+    try:
+        return runner.adapters.get(Platform("band"))
+    except Exception:
+        return None
+
+
+def _resolve_chat_id(adapter: "BandAdapter", chat_id_arg: str) -> Optional[str]:
+    """Pick a chat_id for a tool call.
+
+    Explicit > implicit. When the LLM doesn't pass one we use the adapter's
+    most-recently-active room — fine for the common case where the model is
+    operating on the room it's currently replying in.
+    """
+    if chat_id_arg:
+        return str(chat_id_arg)
+    if adapter._room_last_sender:
+        # Insertion order in Python 3.7+ dicts is preserved; the most
+        # recently recorded room is the one whose last_sender entry was
+        # written most recently, which is what we want.
+        return list(adapter._room_last_sender.keys())[-1]
+    return None
+
+
+def _serialize_participant(p: Any) -> Dict[str, Any]:
+    """Convert a Fern participant model (or dict) to a stable JSON shape."""
+    def _f(name: str) -> Any:
+        if isinstance(p, dict):
+            return p.get(name)
+        return getattr(p, name, None)
+
+    return {
+        "id": _f("id"),
+        "handle": _normalize_handle(_f("handle")) or _f("handle"),
+        "name": _f("name"),
+        "type": _f("type") or _f("participant_type"),
+    }
+
+
+def _serialize_peer(p: Any) -> Dict[str, Any]:
+    """Same shape as a participant; peers come from a different endpoint."""
+    return _serialize_participant(p)
+
+
+def _band_tool_error(message: str) -> str:
+    return _json.dumps({"error": message})
+
+
+async def band_get_participants_handler(args: dict, **_kw: Any) -> str:
+    """List the participants in a Band chat room.
+
+    Async so the registry dispatches us on Hermes' running loop — the SDK
+    REST client holds asyncio.Event locks bound to that loop, so spinning
+    up a fresh loop via ``asyncio.run()`` crashes with
+    "Event is bound to a different event loop".
+    """
+    adapter = _get_live_adapter()
+    if adapter is None:
+        return _band_tool_error("Band gateway is not running in this process")
+
+    chat_id = _resolve_chat_id(adapter, args.get("chat_id", "") if args else "")
+    if not chat_id:
+        return _band_tool_error(
+            "No chat_id available — pass chat_id explicitly or send a message "
+            "in the target room first so the adapter caches it"
+        )
+
+    try:
+        from thenvoi.client.rest import DEFAULT_REQUEST_OPTIONS  # type: ignore
+    except ImportError:
+        DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}  # safe default
+
+    rest = adapter._agent.runtime.link.rest
+
+    try:
+        response = await rest.agent_api_participants.list_agent_chat_participants(
+            chat_id=chat_id, request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+    except Exception as exc:
+        return _band_tool_error(f"list_agent_chat_participants failed: {exc}")
+    data = getattr(response, "data", None) or []
+    return _json.dumps({
+        "chat_id": chat_id,
+        "participants": [_serialize_participant(p) for p in data],
+    })
+
+
+async def band_lookup_peers_handler(args: dict, **_kw: Any) -> str:
+    """List Band peers (users + agents) that can be invited to a room."""
+    adapter = _get_live_adapter()
+    if adapter is None:
+        return _band_tool_error("Band gateway is not running in this process")
+
+    args = args or {}
+    page = int(args.get("page", 1) or 1)
+    page_size = int(args.get("page_size", 50) or 50)
+
+    try:
+        from thenvoi.client.rest import DEFAULT_REQUEST_OPTIONS  # type: ignore
+    except ImportError:
+        DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+
+    rest = adapter._agent.runtime.link.rest
+
+    try:
+        response = await rest.agent_api_peers.list_agent_peers(
+            page=page,
+            page_size=page_size,
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+    except Exception as exc:
+        return _band_tool_error(f"list_agent_peers failed: {exc}")
+    data = getattr(response, "data", None) or []
+    return _json.dumps({
+        "peers": [_serialize_peer(p) for p in data],
+        "page": page,
+        "page_size": page_size,
+    })
+
+
+async def band_add_participant_handler(args: dict, **_kw: Any) -> str:
+    """Invite a peer (user or agent) into a Band chat room by ID."""
+    adapter = _get_live_adapter()
+    if adapter is None:
+        return _band_tool_error("Band gateway is not running in this process")
+
+    args = args or {}
+    identifier = str(args.get("identifier") or "").strip()
+    if not identifier:
+        return _band_tool_error(
+            "identifier is required — pass a peer ID from band_lookup_peers"
+        )
+    role = str(args.get("role") or "member").strip() or "member"
+
+    chat_id = _resolve_chat_id(adapter, args.get("chat_id", "") or "")
+    if not chat_id:
+        return _band_tool_error(
+            "No chat_id available — pass chat_id explicitly or send a message "
+            "in the target room first"
+        )
+
+    try:
+        from thenvoi.client.rest import (  # type: ignore
+            DEFAULT_REQUEST_OPTIONS,
+            ParticipantRequest,
+        )
+    except ImportError as exc:
+        return _band_tool_error(f"Band SDK not importable: {exc}")
+
+    rest = adapter._agent.runtime.link.rest
+
+    try:
+        response = await rest.agent_api_participants.add_agent_chat_participant(
+            chat_id=chat_id,
+            participant=ParticipantRequest(
+                participant_id=identifier, role=role,
+            ),
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+    except Exception as exc:
+        return _band_tool_error(f"add_agent_chat_participant failed: {exc}")
+    added = getattr(response, "data", None)
+    return _json.dumps({
+        "chat_id": chat_id,
+        "added": _serialize_participant(added) if added else {"id": identifier},
+        "role": role,
+    })
+
+
+async def band_remove_participant_handler(args: dict, **_kw: Any) -> str:
+    """Remove a peer from a Band chat room by ID."""
+    adapter = _get_live_adapter()
+    if adapter is None:
+        return _band_tool_error("Band gateway is not running in this process")
+
+    args = args or {}
+    identifier = str(args.get("identifier") or "").strip()
+    if not identifier:
+        return _band_tool_error("identifier is required (the participant ID to remove)")
+
+    chat_id = _resolve_chat_id(adapter, args.get("chat_id", "") or "")
+    if not chat_id:
+        return _band_tool_error(
+            "No chat_id available — pass chat_id explicitly or send a message "
+            "in the target room first"
+        )
+
+    try:
+        from thenvoi.client.rest import DEFAULT_REQUEST_OPTIONS  # type: ignore
+    except ImportError:
+        DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+
+    rest = adapter._agent.runtime.link.rest
+
+    try:
+        await rest.agent_api_participants.remove_agent_chat_participant(
+            chat_id=chat_id,
+            participant_id=identifier,
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+    except Exception as exc:
+        return _band_tool_error(
+            f"remove_agent_chat_participant failed: {exc}"
+        )
+    return _json.dumps({
+        "chat_id": chat_id,
+        "removed": {"id": identifier},
+    })
+
+
+_TOOLSET = "hermes-band"
+
+
+_BAND_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {
+        "name": "band_get_participants",
+        "description": (
+            "List the participants currently in a Band chat room (users and "
+            "agents). Operates on the room you are currently replying in by "
+            "default; pass chat_id to target a different room."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional room UUID. Defaults to the current room.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "band_lookup_peers",
+        "description": (
+            "List Band peers (users and agents) you can invite to a room. "
+            "Use this to find another agent's UUID before calling "
+            "band_add_participant."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "page": {"type": "integer", "description": "Page number (1-indexed)."},
+                "page_size": {
+                    "type": "integer",
+                    "description": "Items per page (default 50, max 100).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "band_add_participant",
+        "description": (
+            "Invite a peer (user or agent) into a Band chat room. Pass the "
+            "peer's UUID as `identifier`; find IDs via band_lookup_peers. "
+            "Defaults to the current room."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "identifier": {
+                    "type": "string",
+                    "description": "Peer UUID from band_lookup_peers.",
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["owner", "admin", "member"],
+                    "description": "Role to assign in the room (default member).",
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional room UUID. Defaults to the current room.",
+                },
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "band_remove_participant",
+        "description": (
+            "Remove a participant from a Band chat room. Pass the peer's UUID "
+            "as `identifier`. Defaults to the current room."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "identifier": {
+                    "type": "string",
+                    "description": "UUID of the participant to remove.",
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Optional room UUID. Defaults to the current room.",
+                },
+            },
+            "required": ["identifier"],
+        },
+    },
+]
+
+
+_BAND_TOOL_HANDLERS: Dict[str, Any] = {
+    "band_get_participants": band_get_participants_handler,
+    "band_lookup_peers": band_lookup_peers_handler,
+    "band_add_participant": band_add_participant_handler,
+    "band_remove_participant": band_remove_participant_handler,
+}
+
+
+def _register_band_tools(ctx: Any) -> None:
+    """Expose Band-native platform tools to the Hermes LLM."""
+    register_tool = getattr(ctx, "register_tool", None)
+    if register_tool is None:
+        # Older ctx implementations (tests, stubs) may not provide tool
+        # registration. Don't crash — platform registration still succeeds.
+        return
+    for schema in _BAND_TOOL_SCHEMAS:
+        register_tool(
+            name=schema["name"],
+            toolset=_TOOLSET,
+            schema=schema,
+            handler=_BAND_TOOL_HANDLERS[schema["name"]],
+            # All handlers are async coroutines so the registry dispatches
+            # them on Hermes' running loop. Without is_async=True, the
+            # registry would call them sync, return a coroutine object,
+            # and the LLM would see a useless "<coroutine ...>" string.
+            is_async=True,
+            requires_env=["BAND_AGENT_ID", "BAND_API_KEY"],
+        )
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -674,6 +1117,12 @@ def register(ctx: Any) -> None:
             "addressed to the participant who spoke last; if you need to "
             "address someone else, mention them explicitly in your text "
             "(e.g. '@alice can you confirm?'). Keep replies focused and "
-            "avoid speaking on behalf of other agents in the room."
+            "avoid speaking on behalf of other agents in the room.\n"
+            "\n"
+            "You can introduce other agents into the conversation: call "
+            "band_lookup_peers to find them, then band_add_participant "
+            "with their UUID. band_get_participants shows who's already "
+            "in the room."
         ),
     )
+    _register_band_tools(ctx)
