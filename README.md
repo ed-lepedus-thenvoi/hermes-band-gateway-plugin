@@ -224,18 +224,55 @@ limactl shell hermes -- tail -f ~/.hermes/logs/agent.log
 ### Running multiple agents in parallel
 
 Each Band agent identity needs its own Hermes instance (the plugin
-holds a scoped lock on `BAND_AGENT_ID`). Spin up a second VM by
-repeating the recipe with a different name and a different env file:
+holds a scoped lock on `BAND_AGENT_ID`). Once you have one VM working,
+**clone it** rather than redoing the full bootstrap — the heavy steps
+(`uv sync`, `uv pip install band-sdk`, plugin symlinks,
+`hermes auth add lmstudio`, `hermes config set …`) are all in the disk
+image already.
 
 ```bash
-limactl create --name=hermes2 /tmp/hermes-lima.yaml --tty=false
+# Write the new agent's env (gitignored under .env.*):
+cat > .env.hermie <<'EOF'
+BAND_AGENT_ID=<new-agent-uuid>
+BAND_API_KEY=<new-api-key>
+BAND_ALLOW_ALL_USERS=true
+LM_BASE_URL=http://host.lima.internal:1234/v1
+LM_API_KEY=lm-studio
+EOF
+chmod 600 .env.hermie
+
+# Clone (Lima requires the source to be stopped briefly):
+limactl stop hermes
+limactl clone hermes hermes2
+limactl start hermes        # source is back up in ~5s
 limactl start hermes2
-# ... bootstrap inside hermes2 with .env.hermes2 (different
-#     BAND_AGENT_ID + BAND_API_KEY)
+
+# Swap creds before starting the gateway (otherwise the clone would
+# try to connect with the source's BAND_AGENT_ID and hit the scoped
+# identity lock):
+limactl shell hermes2 -- bash -c '
+  cp /Users/Shared/_Projects/hermes-band-gateway-plugin/.env.hermie \
+     ~/.hermes/.env && chmod 600 ~/.hermes/.env
+'
+
+# Start its gateway in the background:
+limactl shell hermes2 -- bash -lc '
+  cd ~/hermes-agent &&
+  nohup ~/.local/bin/uv run hermes gateway run \
+    > /tmp/hermes-gateway.log 2>&1 & disown
+'
+
+# Confirm:
+limactl shell hermes2 -- tail -5 ~/.hermes/logs/gateway.log
+# expect: "✓ band connected"
 ```
 
-Both VMs share the host's LM Studio, so total throughput is bounded by
-the model server, not by the agents.
+End-to-end this takes under a minute. All VMs share the host's LM
+Studio, so total throughput is bounded by the model server, not by
+the number of agents.
+
+For the **first** VM (no source to clone from), use the full
+from-scratch recipe above.
 
 ### Tear down
 
