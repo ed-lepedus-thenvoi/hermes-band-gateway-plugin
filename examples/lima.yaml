@@ -1,0 +1,29 @@
+# Lima VM for running Hermes + the Band gateway plugin end-to-end.
+#
+# Used by the "Running in a Lima VM" recipe in ../README.md. Replace the
+# mount `location` below with the absolute path to *your* checkout of
+# this repo before `limactl create --name=hermes /path/to/this/lima.yaml`.
+#
+# Native Apple Silicon (arm64). For Intel Macs, swap the image arch to
+# amd64 and the `arch:` key to `x86_64`.
+
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+cpus: 4
+memory: "4GiB"
+# Thin-provisioned — actual host disk usage grows with the venv. ~3 GiB
+# is typical after `uv sync --extra dev` + band-sdk. 6 GiB leaves headroom.
+disk: "6GiB"
+
+# Mount the plugin source read-write so edits on the host are immediately
+# visible inside the VM (we symlink this mount into hermes-agent's tree
+# from within the VM — see README).
+mounts:
+- location: "/REPLACE/WITH/ABSOLUTE/PATH/TO/hermes-band-gateway-plugin"
+  writable: true
+
+# Default vmType is `vz` on macOS 13+ — fastest networking, lets host
+# services bound to 0.0.0.0 be reached from the guest as
+# `host.lima.internal`.

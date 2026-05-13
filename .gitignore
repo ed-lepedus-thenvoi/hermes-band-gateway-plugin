@@ -3,6 +3,6 @@ __pycache__/
 *.egg-info/
 .venv/
 .env
-.env.local
+.env.*
 .DS_Store
 .claude/

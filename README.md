@@ -84,6 +84,169 @@ is in progress — that's normal, not a bug).
 
 [adding]: https://github.com/anthropics/hermes-agent/blob/main/website/docs/developer-guide/adding-platform-adapters.md
 
+## Running in a Lima VM (end-to-end smoke test)
+
+Recipe for a clean, isolated Linux environment that talks to the Band
+WebSocket and routes inference through a local LM Studio on the macOS
+host. Verified twice in a row at ~5 minutes per VM (after the first
+download). Each VM hosts one Band agent — provision a second VM to run
+a second agent in parallel.
+
+### Prerequisites (macOS host)
+
+1. **Lima ≥ 1.0** — `brew install lima`.
+2. **LM Studio** (or any OpenAI-compatible local server) listening on
+   `0.0.0.0:1234`. Toggle **Developer → Serve on Local Network** in the
+   LM Studio UI; the default `127.0.0.1` bind isn't reachable from the
+   VM. Load a chat-capable model. Sanity check: from the host,
+   `curl http://$(ipconfig getifaddr en0):1234/v1/models` returns a
+   non-empty `data` array.
+3. **Band external agent** — log in to <https://app.band.ai>, **Agents
+   → Create New Agent → External**, copy the **agent ID** (UUID) and
+   the **API key** (shown once).
+
+### One-time host setup
+
+```bash
+git clone <this-repo> ~/projects/hermes-band-gateway-plugin
+cd ~/projects/hermes-band-gateway-plugin
+cp examples/lima.yaml /tmp/hermes-lima.yaml
+# Edit /tmp/hermes-lima.yaml and replace the mount `location:` with the
+# absolute path you just cloned to.
+```
+
+Create a gitignored env file with your Band creds (the file pattern
+`.env.*` is already in `.gitignore`):
+
+```bash
+cat > .env.hermes <<'EOF'
+BAND_AGENT_ID=<your-agent-uuid>
+BAND_API_KEY=<your-band-api-key>
+# Open access for the smoke test — tighten with BAND_ALLOWED_USERS later.
+BAND_ALLOW_ALL_USERS=true
+
+# LM Studio reached from inside the VM. host.lima.internal resolves to
+# the macOS host; LM_API_KEY is a dummy LM Studio ignores.
+LM_BASE_URL=http://host.lima.internal:1234/v1
+LM_API_KEY=lm-studio
+EOF
+chmod 600 .env.hermes
+```
+
+### Boot the VM
+
+```bash
+limactl create --name=hermes /tmp/hermes-lima.yaml --tty=false
+limactl start hermes
+```
+
+First boot downloads the Ubuntu 24.04 arm64 cloud image (~700 MB,
+cached for subsequent VMs). Subsequent VMs from the same yaml take
+under a minute.
+
+### Bootstrap hermes-agent inside the VM
+
+Run everything below as a single `limactl shell hermes -- bash -lc '…'`
+block, or paste line-by-line in `limactl shell hermes`:
+
+```bash
+# 1. Install uv + git.
+curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+sudo apt-get update -qq && sudo apt-get install -qq -y git
+
+# 2. Fresh clone of hermes-agent. We do NOT host-mount it — the host
+#    .venv/ is macOS-only and breaks inside the VM.
+git clone --depth 1 https://github.com/NousResearch/hermes-agent.git ~/hermes-agent
+
+# 3. Pin to a known-good commit (optional but reproducible).
+cd ~/hermes-agent
+git fetch --depth 1 origin 942adf617910f50a39f41bd200d8083bf4cb2bed
+git checkout 942adf617910f50a39f41bd200d8083bf4cb2bed
+
+# 4. Install hermes-agent's dev deps + the Band SDK into a venv.
+~/.local/bin/uv sync --extra dev
+~/.local/bin/uv pip install band-sdk
+
+# 5. Wire the plugin into hermes-agent's plugin tree via the host mount.
+#    Replace the path if you mounted somewhere else.
+ln -s /Users/Shared/_Projects/hermes-band-gateway-plugin \
+      ~/hermes-agent/plugins/platforms/band
+
+# 6. (Optional) symlink the test file so scripts/run_tests.sh sees it.
+ln -s /Users/Shared/_Projects/hermes-band-gateway-plugin/tests/test_band_adapter.py \
+      ~/hermes-agent/tests/gateway/test_band_adapter.py
+
+# 7. Drop the env file you prepared into ~/.hermes/.env.
+mkdir -p ~/.hermes
+cp /Users/Shared/_Projects/hermes-band-gateway-plugin/.env.hermes ~/.hermes/.env
+chmod 600 ~/.hermes/.env
+
+# 8. Configure Hermes to use LM Studio as its inference provider.
+cd ~/hermes-agent
+~/.local/bin/uv run hermes auth add lmstudio --type api-key \
+    --api-key lm-studio \
+    --inference-url http://host.lima.internal:1234/v1
+~/.local/bin/uv run hermes config set provider lmstudio
+~/.local/bin/uv run hermes config set model <model-id-from-lmstudio>
+#   (e.g.  unsloth/qwen3.6-35b-a3b  — pick whatever your LM Studio has loaded;
+#    `curl http://host.lima.internal:1234/v1/models` lists them)
+```
+
+### Verify
+
+```bash
+# Optional smoke test of the plugin's unit tests, run via hermes-agent's
+# canonical harness:
+cd ~/hermes-agent
+scripts/run_tests.sh tests/gateway/test_band_adapter.py
+# expect: 67 passed
+```
+
+### Run the gateway
+
+```bash
+# Foreground — quickest feedback loop.
+cd ~/hermes-agent
+~/.local/bin/uv run hermes gateway run
+```
+
+Wait for `✓ band connected` and `Gateway running with 1 platform(s)`.
+Then in the Band web UI, message your agent (e.g. `@ed01/testmes hi!`)
+and a reply should appear within the LM Studio round-trip time.
+
+Live logs are at `~/.hermes/logs/{gateway,agent,errors}.log` — handy
+for tailing in another terminal:
+
+```bash
+limactl shell hermes -- tail -f ~/.hermes/logs/agent.log
+```
+
+### Running multiple agents in parallel
+
+Each Band agent identity needs its own Hermes instance (the plugin
+holds a scoped lock on `BAND_AGENT_ID`). Spin up a second VM by
+repeating the recipe with a different name and a different env file:
+
+```bash
+limactl create --name=hermes2 /tmp/hermes-lima.yaml --tty=false
+limactl start hermes2
+# ... bootstrap inside hermes2 with .env.hermes2 (different
+#     BAND_AGENT_ID + BAND_API_KEY)
+```
+
+Both VMs share the host's LM Studio, so total throughput is bounded by
+the model server, not by the agents.
+
+### Tear down
+
+```bash
+limactl stop hermes && limactl delete hermes
+```
+
+Removes the VM's disk image entirely; nothing leaks onto the host.
+
+---
+
 ## Access control
 
 Band rooms can contain multiple users and other agents. By default this
