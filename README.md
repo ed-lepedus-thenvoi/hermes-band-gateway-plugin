@@ -199,27 +199,47 @@ cd ~/hermes-agent
 # canonical harness:
 cd ~/hermes-agent
 scripts/run_tests.sh tests/gateway/test_band_adapter.py
-# expect: 67 passed
+# expect: all tests passed
 ```
 
-### Run the gateway
+### Install the gateway as a systemd service
+
+This is the form you want for any VM that should keep running across
+reboots. The service starts automatically when the VM boots and gets
+restarted by systemd if it crashes.
 
 ```bash
-# Foreground — quickest feedback loop.
 cd ~/hermes-agent
-~/.local/bin/uv run hermes gateway run
+# One-time install. --system installs to /etc/systemd/system so it
+# starts at boot without needing a logged-in user (Lima VMs have no
+# interactive login session). --run-as-user keeps the actual gateway
+# process running as your normal user account.
+sudo ~/hermes-agent/.venv/bin/hermes gateway install \
+  --system --run-as-user $USER
+
+# Start it now.
+sudo systemctl start hermes-gateway
+
+# Confirm.
+sudo systemctl status hermes-gateway --no-pager
+# expect: Loaded: ... enabled; Active: active (running)
 ```
 
-Wait for `✓ band connected` and `Gateway running with 1 platform(s)`.
+After `limactl start <vm>`, the gateway is back online ~5–15 seconds
+later with no further input. Logs at `~/.hermes/logs/gateway.log` and
+via `journalctl -u hermes-gateway`.
+
 Then in the Band web UI, message your agent (e.g. `@ed01/testmes hi!`)
 and a reply should appear within the LM Studio round-trip time.
 
-Live logs are at `~/.hermes/logs/{gateway,agent,errors}.log` — handy
-for tailing in another terminal:
-
-```bash
-limactl shell hermes -- tail -f ~/.hermes/logs/agent.log
-```
+> **Foreground mode for iteration.** If you're actively editing the
+> plugin and want to see crash output directly, swap the service for a
+> foreground run:
+> ```bash
+> sudo systemctl stop hermes-gateway
+> cd ~/hermes-agent && ~/.local/bin/uv run hermes gateway run
+> ```
+> Re-start the service when done.
 
 ### Running multiple agents in parallel
 
@@ -247,24 +267,21 @@ limactl clone hermes hermes2
 limactl start hermes        # source is back up in ~5s
 limactl start hermes2
 
-# Swap creds before starting the gateway (otherwise the clone would
-# try to connect with the source's BAND_AGENT_ID and hit the scoped
-# identity lock):
-limactl shell hermes2 -- bash -c '
-  cp /Users/Shared/_Projects/hermes-band-gateway-plugin/.env.hermie \
-     ~/.hermes/.env && chmod 600 ~/.hermes/.env
-'
-
-# Start its gateway in the background:
+# Swap creds before the cloned gateway service connects (otherwise it
+# would use the source's BAND_AGENT_ID and trip the scoped identity
+# lock). The cloned VM already has the systemd service installed and
+# enabled, so we stop it first, swap, then restart:
 limactl shell hermes2 -- bash -lc '
-  cd ~/hermes-agent &&
-  nohup ~/.local/bin/uv run hermes gateway run \
-    > /tmp/hermes-gateway.log 2>&1 & disown
+  sudo systemctl stop hermes-gateway
+  cp /Users/Shared/_Projects/hermes-band-gateway-plugin/.env.hermie \
+     ~/.hermes/.env
+  chmod 600 ~/.hermes/.env
+  sudo systemctl start hermes-gateway
 '
 
 # Confirm:
-limactl shell hermes2 -- tail -5 ~/.hermes/logs/gateway.log
-# expect: "✓ band connected"
+limactl shell hermes2 -- bash -lc 'grep "✓ band connected" ~/.hermes/logs/gateway.log | tail -1'
+# expect: a fresh "✓ band connected" line
 ```
 
 End-to-end this takes under a minute. All VMs share the host's LM
