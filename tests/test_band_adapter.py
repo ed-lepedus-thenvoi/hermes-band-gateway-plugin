@@ -668,6 +668,195 @@ class TestBandAdapterConnect:
         assert adapter._fatal_error_code == "sdk_missing"
 
 
+# ── _run_agent_with_recovery: reconnect on WS drop ───────────────────────
+
+
+class TestBandReconnectLoop:
+    """The Band SDK gives up on a code-1000 close (Band release shutdowns
+    trigger these), and there's no public knob to override that. Our
+    plugin wraps ``agent.run()`` in a loop so a clean exit triggers a
+    rebuild + reconnect with exponential backoff. ``disconnect()`` sets
+    a shutdown flag that breaks the loop cleanly.
+    """
+
+    def _adapter_with_fakes(self, monkeypatch, run_behaviours):
+        """Build a BandAdapter wired with fake SDK so we can drive
+        ``agent.run()`` from the test. ``run_behaviours`` is a list of
+        callables — each invocation pops the next behaviour and uses it
+        as the body of ``agent.run()`` for that attempt.
+        """
+        adapter = BandAdapter(_make_config(agent_id="a", api_key="b"))
+        adapter._bridge = MagicMock()
+        adapter._mark_connected()
+
+        run_call_log = []
+        create_call_log = []
+
+        def _make_run(behaviour):
+            async def _run():
+                run_call_log.append(behaviour)
+                await behaviour(adapter)
+            return _run
+
+        def fake_create(**kwargs):
+            create_call_log.append(kwargs)
+            behaviour = run_behaviours.pop(0)
+            agent = MagicMock()
+            agent.run = _make_run(behaviour)
+            agent.stop = AsyncMock()
+            return agent
+
+        fake_Agent = MagicMock()
+        fake_Agent.create = fake_create
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (fake_Agent, MagicMock(), MagicMock()),
+        )
+
+        # Bypass the real backoff sleep so tests don't actually wait.
+        monkeypatch.setattr(
+            _band_mod.asyncio, "sleep", AsyncMock(return_value=None),
+        )
+
+        # Pre-build the first agent so the loop has something to start with.
+        adapter._agent = fake_create()
+
+        return adapter, run_call_log, create_call_log
+
+    @pytest.mark.asyncio
+    async def test_reconnects_when_run_returns_cleanly(self, monkeypatch):
+        """The headline case: Band closes the WS with code 1000, the SDK
+        returns from agent.run() without raising, and we have to rebuild
+        the Agent and reconnect."""
+        async def clean_exit(adapter):
+            return  # simulates Phoenix code-1000 close
+
+        async def stay_and_then_stop(adapter):
+            adapter._shutdown_requested = True
+
+        adapter, runs, creates = self._adapter_with_fakes(
+            monkeypatch, run_behaviours=[clean_exit, stay_and_then_stop],
+        )
+
+        await adapter._run_agent_with_recovery()
+
+        assert len(runs) == 2, "should have run twice (initial + 1 reconnect)"
+        assert len(creates) == 2, "should have rebuilt the Agent once"
+
+    @pytest.mark.asyncio
+    async def test_reconnects_when_run_raises(self, monkeypatch):
+        """A raised exception is the other path the SDK can take — still
+        recover."""
+        async def boom(adapter):
+            raise RuntimeError("WS error mid-call")
+
+        async def stay_and_then_stop(adapter):
+            adapter._shutdown_requested = True
+
+        adapter, runs, creates = self._adapter_with_fakes(
+            monkeypatch, run_behaviours=[boom, stay_and_then_stop],
+        )
+
+        await adapter._run_agent_with_recovery()
+
+        assert len(runs) == 2
+        assert len(creates) == 2
+
+    @pytest.mark.asyncio
+    async def test_marks_disconnected_during_gap_then_reconnected(self, monkeypatch):
+        """Between attempts, send() should see ``is_connected`` False so
+        it fails fast rather than hitting the dead REST client. After a
+        successful rebuild, we should be marked connected again."""
+        states_during_run = []
+
+        async def first_exit(adapter):
+            return
+
+        async def observe_state_then_stop(adapter):
+            # If the rebuild succeeded, we should be marked connected
+            # again by the time run() is invoked the second time.
+            states_during_run.append(adapter.is_connected)
+            adapter._shutdown_requested = True
+
+        adapter, _, _ = self._adapter_with_fakes(
+            monkeypatch, run_behaviours=[first_exit, observe_state_then_stop],
+        )
+
+        await adapter._run_agent_with_recovery()
+
+        assert states_during_run == [True], (
+            "second run() should see adapter marked connected again"
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_reconnect_when_shutdown_requested(self, monkeypatch):
+        """disconnect() sets _shutdown_requested mid-run. After agent.run()
+        returns cleanly, the loop sees the flag and exits instead of
+        rebuilding."""
+        async def signal_shutdown_then_exit(adapter):
+            # Models the realistic race: disconnect() flips the flag, then
+            # SDK's agent.stop() makes agent.run() return cleanly.
+            adapter._shutdown_requested = True
+
+        # Only one behaviour registered — if the loop wrongly tries to
+        # reconnect we'll pop() an empty list and the test will surface
+        # the bug as an IndexError.
+        adapter, runs, creates = self._adapter_with_fakes(
+            monkeypatch, run_behaviours=[signal_shutdown_then_exit],
+        )
+
+        await adapter._run_agent_with_recovery()
+
+        assert len(runs) == 1
+        assert len(creates) == 1  # only the pre-built initial agent
+
+    @pytest.mark.asyncio
+    async def test_exponential_backoff_between_attempts(self, monkeypatch):
+        """The sleep duration should grow exponentially across failures
+        (1s → 2s → 4s …) so we don't hammer a recovering Band."""
+        async def clean_exit(adapter):
+            return
+
+        async def stop(adapter):
+            adapter._shutdown_requested = True
+
+        sleeps = []
+
+        async def capture_sleep(duration):
+            sleeps.append(duration)
+
+        adapter = BandAdapter(_make_config(agent_id="a", api_key="b"))
+        adapter._bridge = MagicMock()
+        adapter._mark_connected()
+
+        behaviours = [clean_exit, clean_exit, clean_exit, stop]
+
+        def fake_create(**kwargs):
+            behaviour = behaviours.pop(0)
+            agent = MagicMock()
+            async def _run():
+                await behaviour(adapter)
+            agent.run = _run
+            agent.stop = AsyncMock()
+            return agent
+
+        fake_Agent = MagicMock()
+        fake_Agent.create = fake_create
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (fake_Agent, MagicMock(), MagicMock()),
+        )
+        monkeypatch.setattr(_band_mod.asyncio, "sleep", capture_sleep)
+
+        adapter._agent = fake_create()
+        await adapter._run_agent_with_recovery()
+
+        # 3 reconnect attempts → 3 sleeps. Grows exp until capped at 60.
+        assert sleeps[0] == 1.0
+        assert sleeps[1] == 2.0
+        assert sleeps[2] == 4.0
+
+
 # ── register() ───────────────────────────────────────────────────────────
 
 

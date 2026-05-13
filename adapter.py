@@ -152,6 +152,11 @@ class BandAdapter(BasePlatformAdapter):
         self._bridge: Any = None  # _BridgeAdapter instance
         self._run_task: Optional[asyncio.Task] = None
         self._started_event = asyncio.Event()
+        # Set by ``disconnect()`` so the reconnect loop knows to exit
+        # cleanly rather than fight cancellation while rebuilding the
+        # Agent. Without this, ``agent.run()`` returning cleanly during
+        # an in-flight shutdown would re-trigger a reconnect attempt.
+        self._shutdown_requested: bool = False
 
         # Per-room caches used by ``send()``. The Band ``send_message`` tool
         # requires at least one mention, so we track the most recent sender
@@ -239,23 +244,76 @@ class BandAdapter(BasePlatformAdapter):
         logger.info("Band: connected as agent %s via %s", self.agent_id, self.ws_url)
         return True
 
+    # Backoff schedule for reconnects after a dropped WS. 1s start, doubling
+    # to a 60s ceiling so we don't hammer a Band cluster mid-deploy. Kept as
+    # constants so tests can inspect / patch them.
+    _RECONNECT_BACKOFF_START_S: float = 1.0
+    _RECONNECT_BACKOFF_MAX_S: float = 60.0
+
     async def _run_agent_with_recovery(self) -> None:
-        """Run ``agent.run()`` and surface fatal errors to the gateway."""
-        try:
-            await self._agent.run()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("Band: agent.run() crashed: %s", exc, exc_info=True)
-            if self.is_connected:
-                self._set_fatal_error(
-                    "connection_lost",
-                    f"Band agent run loop exited: {exc}",
-                    retryable=True,
+        """Run ``agent.run()`` in a reconnect loop.
+
+        The Phoenix Channels client (Band's underlying WS transport) gives
+        up on a code-1000 close — and Band releases trigger exactly that.
+        The SDK doesn't expose the ``reconnect_on_normal_close`` policy
+        knob, so we wrap ``agent.run()`` ourselves: when it returns (clean
+        or raised), rebuild the Agent and try again with exponential
+        backoff, until ``disconnect()`` signals shutdown.
+        """
+        backoff = self._RECONNECT_BACKOFF_START_S
+        while not self._shutdown_requested:
+            try:
+                await self._agent.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Band: agent.run() raised: %s", exc)
+
+            if self._shutdown_requested:
+                return
+
+            # send() should fail fast during the gap rather than calling
+            # into a dead REST client. We re-mark connected only after a
+            # successful rebuild below.
+            self._mark_disconnected()
+            logger.info(
+                "Band: agent run loop exited; reconnecting in %.1fs", backoff,
+            )
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+
+            if self._shutdown_requested:
+                return
+
+            try:
+                Agent, _SimpleAdapter, _AgentTools = _import_band_sdk()
+                self._agent = Agent.create(
+                    adapter=self._bridge,
+                    agent_id=self.agent_id,
+                    api_key=self.api_key,
+                    ws_url=self.ws_url,
+                    rest_url=self.rest_url,
                 )
-                await self._notify_fatal_error()
+            except Exception as exc:
+                logger.error(
+                    "Band: failed to rebuild Agent: %s — retrying after backoff",
+                    exc,
+                )
+                backoff = min(backoff * 2.0, self._RECONNECT_BACKOFF_MAX_S)
+                continue
+
+            self._mark_connected()
+            backoff = min(backoff * 2.0, self._RECONNECT_BACKOFF_MAX_S)
 
     async def disconnect(self) -> None:
+        # Signal the reconnect loop FIRST so it sees the flag before the
+        # SDK's stop() / cancel propagate. Otherwise a clean return from
+        # agent.run() during shutdown would trigger an unwanted reconnect
+        # attempt before our cancel arrives.
+        self._shutdown_requested = True
+
         if getattr(self, "_lock_key", None):
             try:
                 from gateway.status import release_scoped_lock
