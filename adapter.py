@@ -518,6 +518,24 @@ class BandAdapter(BasePlatformAdapter):
         # Index participants by both ID and normalized handle for O(1) lookup.
         by_id: Dict[str, Dict[str, Any]] = {}
         by_handle: Dict[str, Dict[str, Any]] = {}
+        # ``shortform_counts`` lets us register UNAMBIGUOUS shortform aliases
+        # (the post-slash portion of an owner/agent handle) without guessing
+        # when two participants collide. LLMs naturally write ``@testmes``
+        # rather than ``@ed01/testmes`` because Band's UI shows the short
+        # name — without this aliasing, every cross-agent @mention drops
+        # out of the outbound mentions payload.
+        shortform_counts: Dict[str, int] = {}
+        for p in participants:
+            phandle = (
+                p.get("handle") if isinstance(p, dict) else getattr(p, "handle", None)
+            )
+            if not phandle:
+                continue
+            normalized = _normalize_handle(phandle)
+            if normalized and "/" in normalized:
+                short = "@" + normalized.split("/", 1)[1]
+                shortform_counts[short.lower()] = shortform_counts.get(short.lower(), 0) + 1
+
         for p in participants:
             pid = (p.get("id") if isinstance(p, dict) else getattr(p, "id", None))
             phandle = (
@@ -529,6 +547,19 @@ class BandAdapter(BasePlatformAdapter):
                 normalized = _normalize_handle(phandle)
                 if normalized:
                     by_handle[normalized.lower()] = p
+                    # Register the shortform alias only when (a) it's
+                    # unambiguous across the participant list AND (b) the
+                    # alias doesn't shadow an existing full-handle entry
+                    # (e.g., a user ``@foo`` shouldn't be displaced by a
+                    # shortform alias for ``alice/foo``).
+                    if "/" in normalized:
+                        short = "@" + normalized.split("/", 1)[1]
+                        short_lower = short.lower()
+                        if (
+                            shortform_counts.get(short_lower, 0) == 1
+                            and short_lower not in by_handle
+                        ):
+                            by_handle[short_lower] = p
 
         ordered_handles: List[str] = []
         seen: set = set()

@@ -671,6 +671,75 @@ class TestBandAdapterSend:
         assert set(mentions) == {"@ed01/testtestmes", "@ed"}
 
     @pytest.mark.asyncio
+    async def test_send_resolves_shortform_mention_to_full_band_handle(self, monkeypatch):
+        """LLMs natively write `@testmes` (Band UI shortform / agent name)
+        rather than `@ed01/testmes` (the full owner/agent handle Band stores
+        on each participant). Without shortform support, `@testmes` drops
+        out of the mentions payload — blocking the cross-agent
+        notification path entirely."""
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._room_participants["room-1"] = [
+            {"id": "u-ed",  "handle": "ed",                "type": "User"},
+            {"id": "a-tm",  "handle": "ed01/testmes",      "type": "Agent"},
+            {"id": "a-tt",  "handle": "ed01/testtestmes",  "type": "Agent"},
+            {"id": "a-h",   "handle": "ed01/hermie",       "type": "Agent"},
+        ]
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        await adapter.send(
+            "room-1",
+            "Hey @testmes and @hermie, what do you both think?",
+        )
+
+        mentions = fake_tools_instance.send_message.await_args.kwargs["mentions"]
+        # Shortforms resolve to the full Band handles; the LLM's natural
+        # phrasing reaches both addressees.
+        assert "@ed01/testmes" in mentions
+        assert "@ed01/hermie" in mentions
+
+    def test_extract_text_mentions_skips_ambiguous_shortform(self):
+        """If two participants share the same post-slash short form
+        (`alice/foo` and `bob/foo`), don't register either as a shortform
+        alias — the LLM's `@foo` would be ambiguous and we shouldn't
+        guess. Long-form references still work."""
+        adapter = self._adapter()
+        participants = [
+            {"id": "a1", "handle": "alice/foo", "type": "Agent"},
+            {"id": "a2", "handle": "bob/foo",   "type": "Agent"},
+        ]
+        # `@foo` is ambiguous → dropped
+        mentions = adapter._extract_text_mentions("hi @foo", participants)
+        assert mentions == []
+        # but `@alice/foo` still resolves cleanly
+        mentions = adapter._extract_text_mentions("hi @alice/foo", participants)
+        assert mentions == ["@alice/foo"]
+
+    def test_extract_text_mentions_shortform_does_not_shadow_full_handle(self):
+        """If a participant's full handle happens to BE the short form of
+        another participant (e.g. user `@foo` and agent `alice/foo`), the
+        full-handle match must win — we shouldn't shadow a real
+        participant with a synthetic shortform alias."""
+        adapter = self._adapter()
+        participants = [
+            {"id": "u-foo", "handle": "foo",       "type": "User"},
+            {"id": "a-af",  "handle": "alice/foo", "type": "Agent"},
+        ]
+        mentions = adapter._extract_text_mentions("hi @foo", participants)
+        # Must resolve to the real `@foo` user, not the synthetic shortform.
+        assert mentions == ["@foo"]
+
+    @pytest.mark.asyncio
     async def test_send_resolves_band_wire_format_mentions(self, monkeypatch):
         """Band's wire format ``@[[uuid]]`` sometimes leaks into LLM replies
         because it appears in the inbound text we forward. The adapter
