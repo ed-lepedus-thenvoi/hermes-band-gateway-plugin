@@ -909,24 +909,41 @@ def _resolve_chat_id(adapter: "BandAdapter", chat_id_arg: str) -> Optional[str]:
     return None
 
 
-def _serialize_participant(p: Any) -> Dict[str, Any]:
-    """Convert a Fern participant model (or dict) to a stable JSON shape."""
+def _serialize_participant(p: Any, *, self_agent_id: Optional[str] = None) -> Dict[str, Any]:
+    """Convert a Fern participant model (or dict) to a stable JSON shape.
+
+    When ``self_agent_id`` is supplied and matches the participant's ID,
+    the returned dict gets ``is_self: True`` so the LLM can recognise its
+    own entry without having to guess from a UUID. Non-self entries get
+    no ``is_self`` key at all (cleaner than ``is_self: False`` and avoids
+    misleading the LLM if the field is ever forgotten elsewhere).
+    """
     def _f(name: str) -> Any:
         if isinstance(p, dict):
             return p.get(name)
         return getattr(p, name, None)
 
-    return {
-        "id": _f("id"),
+    pid = _f("id")
+    entry: Dict[str, Any] = {
+        "id": pid,
         "handle": _normalize_handle(_f("handle")) or _f("handle"),
         "name": _f("name"),
         "type": _f("type") or _f("participant_type"),
     }
+    if self_agent_id and pid is not None and str(pid) == str(self_agent_id):
+        entry["is_self"] = True
+    return entry
 
 
-def _serialize_peer(p: Any) -> Dict[str, Any]:
-    """Same shape as a participant; peers come from a different endpoint."""
-    return _serialize_participant(p)
+def _serialize_peer(p: Any, *, self_agent_id: Optional[str] = None) -> Dict[str, Any]:
+    """Same shape as a participant; peers come from a different endpoint.
+
+    Band's ``list_agent_peers`` already excludes the calling agent from
+    its response, so ``is_self`` rarely fires here — we still thread the
+    arg through so the serialiser stays symmetric and future endpoints
+    that DO include self get the marker for free.
+    """
+    return _serialize_participant(p, self_agent_id=self_agent_id)
 
 
 def _band_tool_error(message: str) -> str:
@@ -968,7 +985,10 @@ async def band_get_participants_handler(args: dict, **_kw: Any) -> str:
     data = getattr(response, "data", None) or []
     return _json.dumps({
         "chat_id": chat_id,
-        "participants": [_serialize_participant(p) for p in data],
+        "participants": [
+            _serialize_participant(p, self_agent_id=adapter.agent_id)
+            for p in data
+        ],
     })
 
 
@@ -999,7 +1019,9 @@ async def band_lookup_peers_handler(args: dict, **_kw: Any) -> str:
         return _band_tool_error(f"list_agent_peers failed: {exc}")
     data = getattr(response, "data", None) or []
     return _json.dumps({
-        "peers": [_serialize_peer(p) for p in data],
+        "peers": [
+            _serialize_peer(p, self_agent_id=adapter.agent_id) for p in data
+        ],
         "page": page,
         "page_size": page_size,
     })
@@ -1252,7 +1274,10 @@ def register(ctx: Any) -> None:
             "You can introduce other agents into the conversation: call "
             "band_lookup_peers to find them, then band_add_participant "
             "with their UUID. band_get_participants shows who's already "
-            "in the room."
+            "in the room — the entry marked `\"is_self\": true` is you. "
+            "Inbound messages addressed to you arrive with an "
+            "`@[[<your-uuid>]]` prefix in the wire format — that's just "
+            "routing, you don't need to look it up."
         ),
     )
     _register_band_tools(ctx)

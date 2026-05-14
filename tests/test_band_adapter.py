@@ -1318,6 +1318,32 @@ class TestBandGetParticipantsTool:
         kwargs = rest.agent_api_participants.list_agent_chat_participants.await_args.kwargs
         assert kwargs["chat_id"] == "room-explicit"
 
+    @pytest.mark.asyncio
+    async def test_marks_agents_own_entry_with_is_self(self, live_band):
+        """Without is_self, an LLM that sees its own UUID in inbound wire
+        format and then looks it up here gets a confusing "this UUID
+        exists but isn't a peer I can talk to" result. Marking the entry
+        explicitly lets the model recognise itself."""
+        adapter, rest = live_band  # agent_id == "agent-self"
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[
+                _peer("agent-self", "ed01/me", "Agent", "Me"),
+                _peer("u-ed", "ed", "User", "Ed"),
+                _peer("a-other", "ed01/other", "Agent", "Other"),
+            ])
+        )
+
+        handler = _tool("band_get_participants_handler")
+        result = json.loads(await handler({}))
+
+        by_id = {p["id"]: p for p in result["participants"]}
+        assert by_id["agent-self"].get("is_self") is True
+        # Other participants must NOT have the marker (no false positives).
+        assert "is_self" not in by_id["u-ed"]
+        assert "is_self" not in by_id["a-other"]
+
 
 class TestBandLookupPeersTool:
 
