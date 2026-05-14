@@ -75,6 +75,13 @@ is in progress — that's normal, not a bug).
    # messages a busy agent (the messages still arrive, the announcement
    # is just suppressed):
    # HERMES_GATEWAY_BUSY_ACK_ENABLED=false
+   #
+   # Disable the periodic "⏳ Still working… (N min elapsed)" heartbeat
+   # Hermes posts during long LLM runs. In multi-agent rooms these
+   # heartbeats from agent A get @-mentioned to agent B, which fires
+   # B's own LLM run, which posts ITS own heartbeat, mentioning A
+   # again — reply storm. 0 disables entirely; default is 180s.
+   # HERMES_AGENT_NOTIFY_INTERVAL=0
    ```
 
    …or, equivalently, in `config.yaml`:
