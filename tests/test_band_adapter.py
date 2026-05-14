@@ -584,7 +584,14 @@ class TestBridgeOnMessage:
 class TestBandAdapterSend:
 
     def _adapter(self):
-        return BandAdapter(_make_config(agent_id="agent-self", api_key="b"))
+        a = BandAdapter(_make_config(agent_id="agent-self", api_key="b"))
+        # Production wires REST per-call via _new_rest_client to avoid
+        # cross-loop asyncio.Event poisoning. Tests still set
+        # `_agent.runtime.link.rest = <mock>` for readability; we
+        # forward _new_rest_client to that mock at call time so neither
+        # the test setup nor send()'s factory call needs to change.
+        a._new_rest_client = lambda: a._agent.runtime.link.rest
+        return a
 
     @pytest.mark.asyncio
     async def test_send_fails_when_not_connected(self):
@@ -1011,6 +1018,67 @@ class TestBandAdapterSend:
 # ── BandAdapter.connect failure modes ────────────────────────────────────
 
 
+class TestFreshRestClient:
+    """Regression coverage for the cross-loop asyncio.Event poisoning.
+
+    Hermes' tool dispatcher runs is_async=True handlers in a worker
+    thread with its own event loop. The SDK's shared REST client's
+    asyncio.Event locks bind lazily to whichever loop first uses them,
+    so a tool call from the worker loop poisons the shared client for
+    subsequent main-loop send() calls (and vice versa) — producing
+    "Event is bound to a different event loop" errors at runtime.
+
+    BandAdapter._new_rest_client returns a fresh AsyncRestClient per
+    call. Each fresh client gets its locks bound to the calling loop
+    and is discarded after the operation, so cross-loop pollution is
+    impossible.
+    """
+
+    def test_new_rest_client_constructs_a_fresh_client_each_call(
+        self, monkeypatch
+    ):
+        construct_count = [0]
+
+        def fake_AsyncRestClient(api_key, base_url):
+            construct_count[0] += 1
+            return MagicMock(api_key=api_key, base_url=base_url)
+
+        monkeypatch.setitem(
+            sys.modules, "thenvoi.client.rest",
+            MagicMock(
+                AsyncRestClient=fake_AsyncRestClient,
+                DEFAULT_REQUEST_OPTIONS={"max_retries": 3},
+            ),
+        )
+
+        adapter = BandAdapter(_make_config(agent_id="a", api_key="b"))
+        c1 = adapter._new_rest_client()
+        c2 = adapter._new_rest_client()
+        assert construct_count[0] == 2
+        assert c1 is not c2
+
+    def test_new_rest_client_passes_api_key_and_rest_url(self, monkeypatch):
+        captured = []
+
+        def fake_AsyncRestClient(api_key, base_url):
+            captured.append({"api_key": api_key, "base_url": base_url})
+            return MagicMock()
+
+        monkeypatch.setitem(
+            sys.modules, "thenvoi.client.rest",
+            MagicMock(
+                AsyncRestClient=fake_AsyncRestClient,
+                DEFAULT_REQUEST_OPTIONS={"max_retries": 3},
+            ),
+        )
+
+        adapter = BandAdapter(_make_config(
+            agent_id="a", api_key="secret-key", rest_url="https://x.test",
+        ))
+        adapter._new_rest_client()
+        assert captured == [{"api_key": "secret-key", "base_url": "https://x.test"}]
+
+
 class TestBandAdapterConnect:
 
     @pytest.mark.asyncio
@@ -1414,6 +1482,12 @@ def live_band(monkeypatch):
     Also stubs ``thenvoi.client.rest`` symbols the tool handlers import
     (``DEFAULT_REQUEST_OPTIONS``, ``ParticipantRequest``) so the host
     test venv doesn't need band-sdk installed.
+
+    The fake adapter's ``_new_rest_client`` factory is wired to return
+    the same shared ``rest`` mock — production code should always go
+    through the factory (not adapter._agent.runtime.link.rest directly)
+    to avoid cross-loop asyncio.Event pollution, but tests want to
+    assert against ONE captured mock for simplicity.
     """
     rest = MagicMock()
 
@@ -1421,6 +1495,7 @@ def live_band(monkeypatch):
     fake_adapter._mark_connected()
     fake_adapter._agent = MagicMock()
     fake_adapter._agent.runtime.link.rest = rest
+    fake_adapter._new_rest_client = lambda: rest
 
     monkeypatch.setattr(_band_mod, "_get_live_adapter", lambda: fake_adapter)
 

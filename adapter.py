@@ -418,10 +418,14 @@ class BandAdapter(BasePlatformAdapter):
         except ImportError as exc:
             return SendResult(success=False, error=str(exc))
 
-        link = getattr(self._agent.runtime, "link", None)
-        rest = getattr(link, "rest", None)
-        if rest is None:
-            return SendResult(success=False, error="Band runtime has no REST client")
+        # A fresh REST client per send avoids the cross-loop asyncio.Event
+        # poisoning described on _new_rest_client. The agent's own
+        # runtime.link.rest exists but reusing it would re-poison from
+        # any prior tool call that ran on Hermes' worker thread loop.
+        try:
+            rest = self._new_rest_client()
+        except ImportError as exc:
+            return SendResult(success=False, error=f"Band SDK not importable: {exc}")
 
         participants = self._room_participants.get(chat_id) or []
 
@@ -592,6 +596,25 @@ class BandAdapter(BasePlatformAdapter):
                 _push(participant)
 
         return ordered_handles
+
+    def _new_rest_client(self) -> Any:
+        """Construct a fresh ``AsyncRestClient`` for a single operation.
+
+        Hermes' tool dispatcher runs ``is_async=True`` handlers in a worker
+        thread with its own event loop (see ``model_tools._run_async``).
+        The SDK's shared REST client's ``asyncio.Event`` locks bind lazily
+        to whichever loop first acquires them, so a tool call from the
+        worker loop poisons the shared client for subsequent main-loop
+        ``send()`` calls (and vice versa) — producing
+        "Event is bound to a different event loop" errors at runtime.
+
+        Always returning a fresh client guarantees each operation's
+        asyncio state is created on the calling loop and discarded with
+        it. httpx's pool warmup is amortised in milliseconds; the extra
+        cost is dominated by the REST call itself.
+        """
+        from thenvoi.client.rest import AsyncRestClient  # type: ignore
+        return AsyncRestClient(api_key=self.api_key, base_url=self.rest_url)
 
     async def _lazy_fetch_participants(
         self,
@@ -1035,7 +1058,7 @@ async def band_get_participants_handler(args: dict, **_kw: Any) -> str:
     except ImportError:
         DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}  # safe default
 
-    rest = adapter._agent.runtime.link.rest
+    rest = adapter._new_rest_client()
 
     try:
         response = await rest.agent_api_participants.list_agent_chat_participants(
@@ -1068,7 +1091,7 @@ async def band_lookup_peers_handler(args: dict, **_kw: Any) -> str:
     except ImportError:
         DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
 
-    rest = adapter._agent.runtime.link.rest
+    rest = adapter._new_rest_client()
 
     try:
         response = await rest.agent_api_peers.list_agent_peers(
@@ -1117,7 +1140,7 @@ async def band_add_participant_handler(args: dict, **_kw: Any) -> str:
     except ImportError as exc:
         return _band_tool_error(f"Band SDK not importable: {exc}")
 
-    rest = adapter._agent.runtime.link.rest
+    rest = adapter._new_rest_client()
 
     try:
         response = await rest.agent_api_participants.add_agent_chat_participant(
@@ -1160,7 +1183,7 @@ async def band_remove_participant_handler(args: dict, **_kw: Any) -> str:
     except ImportError:
         DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
 
-    rest = adapter._agent.runtime.link.rest
+    rest = adapter._new_rest_client()
 
     try:
         await rest.agent_api_participants.remove_agent_chat_participant(
