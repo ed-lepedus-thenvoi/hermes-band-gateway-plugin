@@ -218,6 +218,19 @@ class BandAdapter(BasePlatformAdapter):
             self._set_fatal_error("create_failed", str(exc), retryable=True)
             return False
 
+        # Install Bug A recovery on the freshly-created link. See
+        # _install_mark_processed_recovery for full context — without
+        # this the agent's per-agent pipeline silently stalls server-side
+        # whenever Band returns 422 from mark_processed.
+        try:
+            self._install_mark_processed_recovery(self._agent.runtime.link)
+        except Exception as exc:
+            logger.warning(
+                "Band: could not install mark_processed recovery wrapper: %s. "
+                "Agent will run without it; restart may be needed if Bug A fires.",
+                exc,
+            )
+
         # Run the SDK's message loop in the background. ``agent.run()``
         # blocks until shutdown, so we cannot await it here.
         self._run_task = asyncio.create_task(
@@ -296,6 +309,16 @@ class BandAdapter(BasePlatformAdapter):
                     ws_url=self.ws_url,
                     rest_url=self.rest_url,
                 )
+                # Re-install mark_processed recovery on the freshly-
+                # rebuilt link. The wrapper closes over `link.rest`, so
+                # it has to be re-installed after each rebuild.
+                try:
+                    self._install_mark_processed_recovery(self._agent.runtime.link)
+                except Exception as install_exc:
+                    logger.warning(
+                        "Band: could not re-install mark_processed recovery "
+                        "on rebuilt agent: %s", install_exc,
+                    )
             except Exception as exc:
                 logger.error(
                     "Band: failed to rebuild Agent: %s — retrying after backoff",
@@ -596,6 +619,83 @@ class BandAdapter(BasePlatformAdapter):
                 _push(participant)
 
         return ordered_handles
+
+    def _install_mark_processed_recovery(self, link: Any) -> None:
+        """Wrap ``link.mark_processed`` to recover from server-side 422s.
+
+        Bug A in the field: Band's API returns
+        ``status_code: 422, body: Validation failed`` on
+        ``mark_agent_message_processed`` for reasons we can't see from
+        the response. The SDK's ``mark_processed`` swallows the
+        exception (just logs warning), so the SDK's local
+        ``_processed_ids`` dedup cache records the message as done
+        even though Band's server-side per-agent pipeline still has it
+        in the unprocessed queue. Band then refuses to deliver any
+        NEWER message to this agent — total stall, only restart
+        unsticks it. We've seen this hit testmes ~4 times in a single
+        session.
+
+        This wrapper replaces ``link.mark_processed`` to call the
+        underlying REST method directly so we can see the failure, and
+        on failure falls through to ``mark_agent_message_failed`` —
+        which Band considers a legitimate terminal state for the
+        message. Either way the message leaves the unprocessed queue
+        and the pipeline advances.
+
+        We don't lie about success: an upstream "failed" mark is
+        accurate (something genuinely went wrong, even if our agent's
+        reply already delivered). The reason field cites the original
+        error so any future support thread / SDK issue can correlate
+        request_ids server-side.
+        """
+        try:
+            from thenvoi.client.rest import DEFAULT_REQUEST_OPTIONS  # type: ignore
+        except ImportError:
+            DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+
+        rest = link.rest
+
+        async def _mark_processed_with_recovery(
+            room_id: str, message_id: str,
+        ) -> None:
+            # Python 3 deletes the exception-variable binding when the
+            # ``except`` block exits, so hold the failure reason in an
+            # ordinary local that we can reference below.
+            primary_error: Optional[str] = None
+            try:
+                await rest.agent_api_messages.mark_agent_message_processed(
+                    chat_id=room_id, id=message_id,
+                    request_options=DEFAULT_REQUEST_OPTIONS,
+                )
+                return
+            except Exception as primary_exc:
+                primary_error = str(primary_exc)
+                logger.warning(
+                    "Band: mark_processed for message %s failed (%s); "
+                    "falling back to mark_failed so the per-agent pipeline "
+                    "doesn't stall server-side.",
+                    message_id, primary_error,
+                )
+            # Fallback: mark as failed. Same terminal-state effect on
+            # Band's queue without lying about success.
+            try:
+                await rest.agent_api_messages.mark_agent_message_failed(
+                    chat_id=room_id, id=message_id,
+                    error=(
+                        f"mark_processed rejected by server; routed via "
+                        f"mark_failed as recovery. original_error={primary_error}"
+                    ),
+                    request_options=DEFAULT_REQUEST_OPTIONS,
+                )
+            except Exception as fallback_exc:
+                logger.error(
+                    "Band: mark_failed fallback ALSO failed for message %s "
+                    "(%s) — Band's per-agent pipeline may stall until the "
+                    "next reconnect.",
+                    message_id, fallback_exc,
+                )
+
+        link.mark_processed = _mark_processed_with_recovery
 
     def _new_rest_client(self) -> Any:
         """Construct a fresh ``AsyncRestClient`` for a single operation.

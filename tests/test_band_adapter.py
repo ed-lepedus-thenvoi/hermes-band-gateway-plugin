@@ -1018,6 +1018,93 @@ class TestBandAdapterSend:
 # ── BandAdapter.connect failure modes ────────────────────────────────────
 
 
+class TestMarkProcessedRecovery:
+    """Bug A: ``mark_message_processed`` returns 422 from Band, the SDK
+    swallows the exception (just logs warning), and the agent's per-
+    agent pipeline stalls server-side — Band stops delivering new
+    messages until the gateway is restarted.
+
+    Recovery: wrap the LOWER-level REST call so we can actually see the
+    failure, and on 422 fall through to ``mark_message_failed`` (a
+    legitimate terminal state). The message leaves Band's unprocessed
+    queue either way, the pipeline advances, and no false-success
+    signal is sent.
+    """
+
+    def _link(self, *, processed_side_effect=None, failed_side_effect=None):
+        link = MagicMock()
+        link.rest.agent_api_messages.mark_agent_message_processed = AsyncMock(
+            side_effect=processed_side_effect,
+        )
+        link.rest.agent_api_messages.mark_agent_message_failed = AsyncMock(
+            side_effect=failed_side_effect,
+        )
+        return link
+
+    @pytest.mark.asyncio
+    async def test_happy_path_passes_through_to_processed(self, monkeypatch):
+        monkeypatch.setitem(
+            sys.modules, "thenvoi.client.rest",
+            MagicMock(DEFAULT_REQUEST_OPTIONS={"max_retries": 3}),
+        )
+        adapter = BandAdapter(_make_config(agent_id="a", api_key="b"))
+        link = self._link()
+        adapter._install_mark_processed_recovery(link)
+
+        await link.mark_processed("room-1", "msg-1")
+
+        link.rest.agent_api_messages.mark_agent_message_processed.assert_awaited_once()
+        link.rest.agent_api_messages.mark_agent_message_failed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_422_falls_through_to_mark_failed(self, monkeypatch):
+        monkeypatch.setitem(
+            sys.modules, "thenvoi.client.rest",
+            MagicMock(DEFAULT_REQUEST_OPTIONS={"max_retries": 3}),
+        )
+        adapter = BandAdapter(_make_config(agent_id="a", api_key="b"))
+        link = self._link(
+            processed_side_effect=RuntimeError("status_code: 422, body: Validation failed"),
+        )
+        adapter._install_mark_processed_recovery(link)
+
+        # Wrapper does not propagate the original failure — that would
+        # poison the SDK's local _processed_ids dedup cache.
+        await link.mark_processed("room-1", "msg-1")
+
+        link.rest.agent_api_messages.mark_agent_message_processed.assert_awaited_once()
+        link.rest.agent_api_messages.mark_agent_message_failed.assert_awaited_once()
+        kwargs = link.rest.agent_api_messages.mark_agent_message_failed.await_args.kwargs
+        assert kwargs["chat_id"] == "room-1"
+        assert kwargs["id"] == "msg-1"
+        # Reason cites the original error so an upstream report can
+        # correlate against the 422 request_id chain.
+        assert "422" in kwargs["error"]
+
+    @pytest.mark.asyncio
+    async def test_both_failed_does_not_raise(self, monkeypatch, caplog):
+        monkeypatch.setitem(
+            sys.modules, "thenvoi.client.rest",
+            MagicMock(DEFAULT_REQUEST_OPTIONS={"max_retries": 3}),
+        )
+        adapter = BandAdapter(_make_config(agent_id="a", api_key="b"))
+        link = self._link(
+            processed_side_effect=RuntimeError("422"),
+            failed_side_effect=RuntimeError("500"),
+        )
+        adapter._install_mark_processed_recovery(link)
+
+        # Both REST calls fail — wrapper still must not raise (the SDK's
+        # contract for mark_processed is "always succeeds"; raising
+        # here would corrupt the SDK's local message dedup state).
+        with caplog.at_level("ERROR", logger="hermes_plugins.band_platform.adapter"):
+            await link.mark_processed("room-1", "msg-1")
+        assert any(
+            "mark_failed fallback ALSO failed" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 class TestFreshRestClient:
     """Regression coverage for the cross-loop asyncio.Event poisoning.
 
