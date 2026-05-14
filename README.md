@@ -54,11 +54,27 @@ is in progress — that's normal, not a bug).
    # Optional — only override for self-hosted / staging deployments:
    # BAND_REST_URL=https://app.band.ai
    # BAND_WS_URL=wss://app.band.ai/api/v1/socket/websocket
-   # Default room for `cronjob(deliver=band, ...)`:
+   # Default room for `cronjob(deliver=band, ...)`. Also suppresses the
+   # one-time "📬 No home channel is set for Band" prompt on new sessions:
    # BAND_HOME_CHANNEL=<room-uuid>
+   # BAND_HOME_CHANNEL_NAME=<friendly label>
    # Access control (default deny; see below):
    # BAND_ALLOWED_USERS=@alice,@bob
    # BAND_ALLOW_ALL_USERS=false
+
+   # Hermes-side runtime knobs that materially affect Band UX. Not
+   # plugin-specific, but worth tuning for multi-agent rooms:
+   #
+   # What happens when a new user message arrives mid-LLM-run:
+   #   interrupt (default) — cancel the in-flight task
+   #   queue              — wait for the current task to finish first
+   #   steer              — inject into the next tool call without cancelling
+   # HERMES_GATEWAY_BUSY_INPUT_MODE=steer
+   #
+   # Silence the ⚡ / ⏳ / ⏩ ack messages Hermes posts when a user
+   # messages a busy agent (the messages still arrive, the announcement
+   # is just suppressed):
+   # HERMES_GATEWAY_BUSY_ACK_ENABLED=false
    ```
 
    …or, equivalently, in `config.yaml`:
