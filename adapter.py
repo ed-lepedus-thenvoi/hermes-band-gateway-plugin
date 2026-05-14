@@ -978,11 +978,18 @@ def _serialize_participant(p: Any, *, self_agent_id: Optional[str] = None) -> Di
         return getattr(p, name, None)
 
     pid = _f("id")
+    normalized_handle = _normalize_handle(_f("handle")) or _f("handle")
     entry: Dict[str, Any] = {
         "id": pid,
-        "handle": _normalize_handle(_f("handle")) or _f("handle"),
+        "handle": normalized_handle,
         "name": _f("name"),
         "type": _f("type") or _f("participant_type"),
+        # Canonical full-form handle the LLM should use when @-mentioning
+        # this participant in a reply. Same as ``handle`` today, but
+        # surfaced under an explicit name so platform_hint can point the
+        # LLM at it without ambiguity (Band's UI displays the short form
+        # which doesn't always resolve to a unique participant).
+        "mention_handle": normalized_handle,
     }
     if self_agent_id and pid is not None and str(pid) == str(self_agent_id):
         entry["is_self"] = True
@@ -1321,9 +1328,13 @@ def register(ctx: Any) -> None:
             "platform. Rooms can contain multiple users and other agents. "
             "Messages support standard markdown. Every reply you send is "
             "addressed to the participant who spoke last; if you need to "
-            "address someone else, mention them explicitly in your text "
-            "(e.g. '@alice can you confirm?'). Keep replies focused and "
-            "avoid speaking on behalf of other agents in the room.\n"
+            "address someone else, mention them explicitly in your text. "
+            "When @-mentioning anyone, copy the `mention_handle` field "
+            "verbatim from band_get_participants (e.g. `@ed01/testmes`, "
+            "not the short `@testmes` that Band's UI displays) — only "
+            "the full owner/agent form addresses participants reliably "
+            "across rooms. Keep replies focused and avoid speaking on "
+            "behalf of other agents in the room.\n"
             "\n"
             "You can introduce other agents into the conversation: call "
             "band_lookup_peers to find them, then band_add_participant "

@@ -1493,6 +1493,29 @@ class TestBandGetParticipantsTool:
         assert kwargs["chat_id"] == "room-explicit"
 
     @pytest.mark.asyncio
+    async def test_includes_mention_handle_on_every_entry(self, live_band):
+        """Every entry should carry an explicit `mention_handle` field —
+        the canonical full-form @-handle the LLM should use in reply
+        text. Lets us nudge the LLM via platform_hint to ``use the
+        mention_handle field``, rather than having it guess between
+        the short and long form Band's UI shows for the same
+        participant."""
+        _adapter, rest = live_band
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[
+                _peer("agent-self", "ed01/me", "Agent", "Me"),
+                _peer("u-ed", "ed", "User", "Ed"),
+            ])
+        )
+
+        handler = _tool("band_get_participants_handler")
+        result = json.loads(await handler({"chat_id": "room-1"}))
+
+        by_id = {p["id"]: p for p in result["participants"]}
+        assert by_id["agent-self"]["mention_handle"] == "@ed01/me"
+        assert by_id["u-ed"]["mention_handle"] == "@ed"
+
+    @pytest.mark.asyncio
     async def test_marks_agents_own_entry_with_is_self(self, live_band):
         """Without is_self, an LLM that sees its own UUID in inbound wire
         format and then looks it up here gets a confusing "this UUID
