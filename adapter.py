@@ -356,6 +356,27 @@ class BandAdapter(BasePlatformAdapter):
             return False
         return _normalize_handle(handle) in self._allowed_handles
 
+    def _strip_leading_self_mention(self, text: str) -> str:
+        """Remove a leading ``@[[<own-agent-id>]]`` from inbound text.
+
+        Band addresses messages to an agent with this wire-format prefix.
+        Hermes' slash-command detector is ``text.startswith("/")``, so
+        without stripping, ``/model`` / ``/sethome`` / ``/help`` etc.
+        fall through to the LLM, which then hallucinates plausible
+        answers instead of invoking the real handlers. Strip ONLY the
+        leading occurrence (with adjacent whitespace) — mid-text
+        self-mentions are left alone so anything the LLM might want to
+        quote remains intact, and the is_self marker on tool output
+        covers any lookup confusion.
+        """
+        if not text or not self.agent_id:
+            return text
+        pattern = re.compile(
+            r"^\s*@\[\[" + re.escape(self.agent_id) + r"\]\]\s*",
+            flags=re.IGNORECASE,
+        )
+        return pattern.sub("", text, count=1)
+
     def _record_inbound(self, room_id: str, msg: Any, participants: List[Dict[str, Any]]) -> None:
         """Cache room state so ``send()`` can address replies later."""
         if participants:
@@ -668,7 +689,9 @@ def _BridgeAdapter(simple_adapter_cls: type, hermes: BandAdapter):
                 )
                 return
 
-            text = getattr(msg, "content", "") or ""
+            text = hermes._strip_leading_self_mention(
+                getattr(msg, "content", "") or ""
+            )
             if not text.strip():
                 return
 

@@ -472,6 +472,111 @@ class TestBridgeOnMessage:
 
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_strips_leading_self_mention_so_slash_commands_fire(
+        self, bridge_factory
+    ):
+        """Band addresses messages with @[[<agent-id>]] in the body. Hermes'
+        slash-command detector is just text.startswith('/'), so the prefix
+        breaks /model, /sethome, /help etc — the message falls through to
+        the LLM, which then hallucinates plausible-looking answers. Strip
+        the leading self-mention so the '/' is at position 0 and the real
+        handler fires."""
+        adapter, bridge = bridge_factory(agent_id="agent-self", allow_all=True)
+        adapter.handle_message = AsyncMock()
+
+        msg = _msg(content="@[[agent-self]] /model")
+        tools = MagicMock(participants=[{"id": "u1", "handle": "u", "type": "User"}])
+
+        await bridge.on_message(
+            msg, tools,
+            history=None, participants_msg=None, contacts_msg=None,
+            is_session_bootstrap=False, room_id="room-1",
+        )
+
+        event = adapter.handle_message.call_args.args[0]
+        assert event.text == "/model"  # Hermes' is_command() now matches.
+
+    @pytest.mark.asyncio
+    async def test_strips_leading_self_mention_with_extra_whitespace(
+        self, bridge_factory
+    ):
+        adapter, bridge = bridge_factory(agent_id="agent-self", allow_all=True)
+        adapter.handle_message = AsyncMock()
+
+        msg = _msg(content="  @[[agent-self]]   how are you?")
+        tools = MagicMock(participants=[{"id": "u1", "handle": "u", "type": "User"}])
+
+        await bridge.on_message(
+            msg, tools,
+            history=None, participants_msg=None, contacts_msg=None,
+            is_session_bootstrap=False, room_id="room-1",
+        )
+
+        event = adapter.handle_message.call_args.args[0]
+        assert event.text == "how are you?"
+
+    @pytest.mark.asyncio
+    async def test_preserves_non_leading_self_mention(self, bridge_factory):
+        """Only the leading self-mention is stripped. A self-reference
+        later in the body is left alone — the is_self marker in the
+        tool output handles that case if the LLM looks it up."""
+        adapter, bridge = bridge_factory(agent_id="agent-self", allow_all=True)
+        adapter.handle_message = AsyncMock()
+
+        msg = _msg(content="@[[agent-self]] please mention @[[agent-self]] later")
+        tools = MagicMock(participants=[{"id": "u1", "handle": "u", "type": "User"}])
+
+        await bridge.on_message(
+            msg, tools,
+            history=None, participants_msg=None, contacts_msg=None,
+            is_session_bootstrap=False, room_id="room-1",
+        )
+
+        event = adapter.handle_message.call_args.args[0]
+        assert event.text == "please mention @[[agent-self]] later"
+
+    @pytest.mark.asyncio
+    async def test_preserves_other_agents_leading_mention(self, bridge_factory):
+        """A message addressed to *another* agent (forwarded into our room
+        somehow) keeps its leading mention — the LLM needs that addressing
+        context to know it wasn't the primary addressee."""
+        adapter, bridge = bridge_factory(agent_id="agent-self", allow_all=True)
+        adapter.handle_message = AsyncMock()
+
+        msg = _msg(content="@[[other-agent]] @[[agent-self]] FYI")
+        tools = MagicMock(participants=[
+            {"id": "other-agent", "handle": "ed01/other", "type": "Agent"},
+            {"id": "u1", "handle": "u", "type": "User"},
+        ])
+
+        await bridge.on_message(
+            msg, tools,
+            history=None, participants_msg=None, contacts_msg=None,
+            is_session_bootstrap=False, room_id="room-1",
+        )
+
+        event = adapter.handle_message.call_args.args[0]
+        assert event.text == "@[[other-agent]] @[[agent-self]] FYI"
+
+    @pytest.mark.asyncio
+    async def test_drops_message_that_was_only_self_mention(self, bridge_factory):
+        """If stripping the self-mention leaves an empty string, the
+        inbound was just routing noise — don't run the LLM on nothing."""
+        adapter, bridge = bridge_factory(agent_id="agent-self", allow_all=True)
+        adapter.handle_message = AsyncMock()
+
+        msg = _msg(content="  @[[agent-self]]  ")
+        tools = MagicMock(participants=[{"id": "u1", "handle": "u", "type": "User"}])
+
+        await bridge.on_message(
+            msg, tools,
+            history=None, participants_msg=None, contacts_msg=None,
+            is_session_bootstrap=False, room_id="room-1",
+        )
+
+        adapter.handle_message.assert_not_called()
+
 
 # ── BandAdapter.send ─────────────────────────────────────────────────────
 
