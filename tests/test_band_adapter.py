@@ -710,6 +710,107 @@ class TestBandAdapterSend:
         assert mentions == ["@ed"]  # ghost dropped, last sender retained
 
     @pytest.mark.asyncio
+    async def test_send_lazy_fetches_participants_when_cache_empty(self, monkeypatch):
+        """Right after a service restart, the SDK hasn't yet hydrated the
+        per-room participants list, so the first inbound that triggers a
+        reply hits send() with an empty cache and would otherwise fail
+        with "no known recipients". The adapter should fall back to a
+        one-shot REST call so the first reply still goes out."""
+        adapter = self._adapter()  # agent_id = "agent-self"
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        rest = MagicMock()
+        adapter._agent.runtime.link.rest = rest
+
+        # Cold cache — no _room_last_sender, no _room_participants.
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[
+                _peer("agent-self", "ed01/me", "Agent"),
+                _peer("u-ed", "ed", "User"),
+            ])
+        )
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+        # Stub the SDK's rest module so the lazy-fetch import succeeds.
+        monkeypatch.setitem(
+            sys.modules, "thenvoi.client.rest",
+            MagicMock(DEFAULT_REQUEST_OPTIONS={"max_retries": 3}),
+        )
+
+        result = await adapter.send("room-1", "Hello room")
+        assert result.success is True
+        # Lazy fetch happened exactly once.
+        rest.agent_api_participants.list_agent_chat_participants.assert_awaited_once()
+        # Cache is now populated for the next send() — no re-fetch needed.
+        assert len(adapter._room_participants["room-1"]) == 2
+        # Self filtered out, the human user came through as the mention.
+        mentions = fake_tools_instance.send_message.await_args.kwargs["mentions"]
+        assert "@ed" in mentions
+        assert "@ed01/me" not in mentions
+
+    @pytest.mark.asyncio
+    async def test_send_skips_lazy_fetch_when_cache_populated(self, monkeypatch):
+        """If we already have participants cached for the room (the
+        normal steady-state case), send() must NOT hit REST again.
+        Otherwise every reply pays an extra round-trip."""
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        rest = MagicMock()
+        adapter._agent.runtime.link.rest = rest
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock()
+
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._room_participants["room-1"] = [
+            {"id": "u-ed", "handle": "ed", "type": "User"},
+        ]
+
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        await adapter.send("room-1", "hello")
+        rest.agent_api_participants.list_agent_chat_participants.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_lazy_fetch_failure_falls_through_to_error(self, monkeypatch):
+        """If the lazy REST fetch itself fails, we shouldn't crash —
+        fall through to the existing "no known recipients" SendResult
+        so the caller still gets a clean error."""
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        rest = MagicMock()
+        adapter._agent.runtime.link.rest = rest
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            side_effect=RuntimeError("REST 503"),
+        )
+
+        fake_tools_cls = MagicMock()
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+        monkeypatch.setitem(
+            sys.modules, "thenvoi.client.rest",
+            MagicMock(DEFAULT_REQUEST_OPTIONS={"max_retries": 3}),
+        )
+
+        result = await adapter.send("room-1", "hi")
+        assert result.success is False
+        assert "no known recipients" in result.error
+
+    @pytest.mark.asyncio
     async def test_send_surfaces_sdk_error_as_send_failure(self, monkeypatch):
         adapter = self._adapter()
         adapter._mark_connected()

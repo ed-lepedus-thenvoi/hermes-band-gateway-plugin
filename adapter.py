@@ -403,6 +403,19 @@ class BandAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Band runtime has no REST client")
 
         participants = self._room_participants.get(chat_id) or []
+
+        # Cold-cache recovery: right after a service restart the SDK's
+        # ExecutionContext hasn't yet hydrated participants for this room,
+        # so the bridge handed us an empty list when the inbound arrived.
+        # Without participants we can't resolve a mention and send() would
+        # fail with "no known recipients", dropping the first reply.
+        # Pay one REST round-trip to fetch them ourselves so the first
+        # send still goes out.
+        if not participants:
+            participants = await self._lazy_fetch_participants(chat_id, rest)
+            if participants:
+                self._room_participants[chat_id] = participants
+
         tools = AgentTools(chat_id, rest, participants=participants)
 
         # Mention resolution layers, in priority order:
@@ -527,6 +540,45 @@ class BandAdapter(BasePlatformAdapter):
                 _push(participant)
 
         return ordered_handles
+
+    async def _lazy_fetch_participants(
+        self,
+        chat_id: str,
+        rest: Any,
+    ) -> List[Dict[str, Any]]:
+        """One-shot REST call to populate the participants cache.
+
+        Used by ``send()`` when the bridge handed us an empty participants
+        list (typical right after a service restart, before the SDK has
+        hydrated its per-room ExecutionContext). On failure we log and
+        return an empty list — the caller surfaces a clean
+        ``SendResult.error`` from there rather than crashing.
+        """
+        try:
+            from thenvoi.client.rest import DEFAULT_REQUEST_OPTIONS  # type: ignore
+        except ImportError:
+            DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+
+        try:
+            response = await rest.agent_api_participants.list_agent_chat_participants(
+                chat_id=chat_id, request_options=DEFAULT_REQUEST_OPTIONS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Band: lazy participants fetch for room %s failed: %s",
+                chat_id, exc,
+            )
+            return []
+        data = getattr(response, "data", None) or []
+        return [
+            {
+                "id": getattr(p, "id", None) or (p.get("id") if isinstance(p, dict) else None),
+                "handle": getattr(p, "handle", None) or (p.get("handle") if isinstance(p, dict) else None),
+                "name": getattr(p, "name", None) or (p.get("name") if isinstance(p, dict) else None),
+                "type": getattr(p, "type", None) or (p.get("type") if isinstance(p, dict) else None),
+            }
+            for p in data
+        ]
 
     def _resolve_default_mentions(
         self,
