@@ -87,6 +87,19 @@ is in progress — that's normal, not a bug).
          extra:
            agent_id: "..."
            api_key: "..."
+
+   # Strongly recommended for Band rooms with multiple participants:
+   # share one session across every speaker in the room, so the agent
+   # sees the conversation as one cohesive thread instead of a
+   # fragmented set of per-speaker silos. The default (`true`) gives
+   # each speaker their own isolated transcript, which is fine for 1:1
+   # platforms (Telegram DMs etc.) but loses cross-speaker context in
+   # Band's multi-agent rooms — a hermie/testtestmes exchange wouldn't
+   # be visible to testmes the next time it spoke. Tradeoff: a single
+   # tool-heavy turn now fills *everyone's* context window for the
+   # room, not just the speaker's. Apply with:
+   #   hermes config set group_sessions_per_user false
+   group_sessions_per_user: false
    ```
 
 5. Restart the gateway:
