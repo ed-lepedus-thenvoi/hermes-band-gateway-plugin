@@ -1105,6 +1105,239 @@ class TestMarkProcessedRecovery:
         )
 
 
+class TestBandEventReporting:
+    """Posts visual-debugging events (tool_call / tool_result / error)
+    to Band via the chat events REST endpoint. The SDK's Pydantic
+    `SendEventInput` helper is narrowed to thought/error/task, but the
+    wire-level `ChatEventRequest` accepts all five — including the two
+    we care about for tool transparency. We bypass the helper.
+    """
+
+    @pytest.fixture
+    def stub_rest_module(self, monkeypatch):
+        captured: Dict[str, Any] = {}
+        def fake_ChatEventRequest(content, message_type, metadata=None):
+            captured.update({"content": content, "message_type": message_type, "metadata": metadata})
+            return SimpleNamespace(
+                content=content, message_type=message_type, metadata=metadata,
+            )
+        rest_client = MagicMock()
+        rest_client.agent_api_events.create_agent_chat_event = AsyncMock()
+        fake_module = MagicMock(
+            DEFAULT_REQUEST_OPTIONS={"max_retries": 3},
+            ChatEventRequest=fake_ChatEventRequest,
+            AsyncRestClient=MagicMock(return_value=rest_client),
+        )
+        monkeypatch.setitem(sys.modules, "thenvoi.client.rest", fake_module)
+        return captured, rest_client
+
+    def _adapter(self):
+        return BandAdapter(_make_config(agent_id="self-id", api_key="b"))
+
+    # --- pure payload helpers ----------------------------------------------
+
+    def test_build_tool_call_event_shape(self):
+        adapter = self._adapter()
+        content, meta = adapter._build_tool_call_event(
+            "band_lookup_peers", {"page": 1}, tool_call_id="t-1",
+        )
+        assert "band_lookup_peers" in content
+        assert meta["tool_name"] == "band_lookup_peers"
+        assert meta["args"] == {"page": 1}
+        assert meta["tool_call_id"] == "t-1"
+
+    def test_build_tool_result_event_truncates_large_results(self):
+        adapter = self._adapter()
+        huge = "x" * 5000
+        content, meta = adapter._build_tool_result_event(
+            "band_get_participants", {}, huge, duration_ms=42,
+        )
+        assert "band_get_participants" in content
+        assert "42" in content  # duration in human content
+        assert meta["duration_ms"] == 42
+        assert len(meta["result_excerpt"]) < len(huge)  # truncated
+
+    # --- _post_band_event --------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_post_band_event_happy_path(self, stub_rest_module):
+        _captured, rest_client = stub_rest_module
+        adapter = self._adapter()
+
+        await adapter._post_band_event(
+            "room-1", "Calling X", "tool_call", {"foo": "bar"},
+        )
+        rest_client.agent_api_events.create_agent_chat_event.assert_awaited_once()
+        kwargs = rest_client.agent_api_events.create_agent_chat_event.await_args.kwargs
+        assert kwargs["chat_id"] == "room-1"
+        evt = kwargs["event"]
+        assert evt.content == "Calling X"
+        assert evt.message_type == "tool_call"
+        assert evt.metadata == {"foo": "bar"}
+
+    @pytest.mark.asyncio
+    async def test_post_band_event_disabled_by_env(self, monkeypatch, stub_rest_module):
+        _captured, rest_client = stub_rest_module
+        monkeypatch.setenv("HERMES_BAND_EVENT_REPORTING", "false")
+        adapter = self._adapter()
+
+        await adapter._post_band_event("room-1", "x", "tool_call")
+        rest_client.agent_api_events.create_agent_chat_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_band_event_no_op_without_chat_id(self, stub_rest_module):
+        _captured, rest_client = stub_rest_module
+        adapter = self._adapter()
+        await adapter._post_band_event("", "x", "tool_call")
+        rest_client.agent_api_events.create_agent_chat_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_band_event_swallows_rest_failure(self, stub_rest_module, caplog):
+        _captured, rest_client = stub_rest_module
+        rest_client.agent_api_events.create_agent_chat_event = AsyncMock(
+            side_effect=RuntimeError("REST 503"),
+        )
+        adapter = self._adapter()
+
+        # Must not raise — the event post is best-effort; a failure
+        # should never break the actual tool dispatch.
+        await adapter._post_band_event("room-1", "x", "tool_call")
+
+    # --- _active_chat_id ---------------------------------------------------
+
+    def test_active_chat_id_returns_most_recently_recorded_room(self):
+        adapter = self._adapter()
+        assert adapter._active_chat_id() is None  # cold cache
+
+        adapter._last_active_room_id = "room-A"
+        assert adapter._active_chat_id() == "room-A"
+
+        adapter._last_active_room_id = "room-B"
+        assert adapter._active_chat_id() == "room-B"
+
+    def test_record_inbound_updates_active_chat_id(self):
+        adapter = self._adapter()
+        msg = _msg(sender_id="u-1")
+        adapter._record_inbound("room-1", msg, [])
+        assert adapter._last_active_room_id == "room-1"
+
+        adapter._record_inbound("room-2", msg, [])
+        assert adapter._last_active_room_id == "room-2"
+
+
+class TestSystemNoticeRerouting:
+    """Hermes posts lifecycle-status notices ("⚠️ provider stream drop…",
+    "⏳ Retrying in 2s (attempt 1/3)…", "API call failed after 3
+    retries: …") via the same send() path as regular replies. In a
+    multi-agent room they end up as chat noise everyone else sees and
+    sometimes replies to. Route them through Band's `error` event
+    channel instead so they appear in the Events pane, not the Text
+    pane.
+    """
+
+    def _adapter(self):
+        return BandAdapter(_make_config(agent_id="self-id", api_key="b"))
+
+    def test_is_system_notice_matches_known_patterns(self):
+        adapter = self._adapter()
+        cases = [
+            "⚠️ lmstudio stream drop (RemoteProtocolError) after 1586.8s — reconnecting, retry 2/3",
+            "⏳ Retrying in 2.2s (attempt 1/3)...",
+            "API call failed after 3 retries: Connection error.",
+            "❌ Operation cancelled",
+            "🛑 Aborted",
+        ]
+        for c in cases:
+            assert adapter._is_system_notice(c), f"should match: {c!r}"
+
+    def test_is_system_notice_ignores_regular_replies(self):
+        adapter = self._adapter()
+        cases = [
+            "Hey ed, what's up?",
+            "Sure, here's an answer.",
+            "I had a thought: maybe we should retry the approach next time.",  # contains "retry" but not a notice prefix
+            "I love the new ⚠️ emoji — looks great.",  # emoji mid-text isn't a notice
+        ]
+        for c in cases:
+            assert not adapter._is_system_notice(c), f"should NOT match: {c!r}"
+
+    @pytest.mark.asyncio
+    async def test_send_reroutes_system_notice_to_error_event(self, monkeypatch):
+        adapter = self._adapter()
+        adapter._mark_connected()
+        adapter._agent = MagicMock()
+        adapter._agent.runtime.link.rest = MagicMock()
+        adapter._room_last_sender["room-1"] = {"id": "u-ed", "handle": "@ed"}
+        adapter._last_active_room_id = "room-1"
+
+        # Capture both the band send_message (chat-text path — should NOT
+        # be called) and the chat-event REST call (where the notice should
+        # land).
+        fake_tools_instance = MagicMock()
+        fake_tools_instance.send_message = AsyncMock(return_value=MagicMock(id="m"))
+        fake_tools_cls = MagicMock(return_value=fake_tools_instance)
+        monkeypatch.setattr(
+            _band_mod, "_import_band_sdk",
+            lambda: (MagicMock(), MagicMock(), fake_tools_cls),
+        )
+
+        rest_client = MagicMock()
+        rest_client.agent_api_events.create_agent_chat_event = AsyncMock()
+        fake_rest_module = MagicMock(
+            DEFAULT_REQUEST_OPTIONS={"max_retries": 3},
+            ChatEventRequest=lambda content, message_type, metadata=None: SimpleNamespace(
+                content=content, message_type=message_type, metadata=metadata,
+            ),
+            AsyncRestClient=MagicMock(return_value=rest_client),
+        )
+        monkeypatch.setitem(sys.modules, "thenvoi.client.rest", fake_rest_module)
+
+        result = await adapter.send(
+            "room-1", "⏳ Retrying in 2.2s (attempt 1/3)...",
+        )
+
+        # Returns success so Hermes' status-callback flow keeps moving.
+        assert result.success is True
+        # Notice did NOT go out as a chat message...
+        fake_tools_instance.send_message.assert_not_called()
+        # ...it went out as a Band error event instead.
+        rest_client.agent_api_events.create_agent_chat_event.assert_awaited_once()
+        evt_kwargs = rest_client.agent_api_events.create_agent_chat_event.await_args.kwargs
+        assert evt_kwargs["chat_id"] == "room-1"
+        assert evt_kwargs["event"].message_type == "error"
+
+
+class TestEventReportingRegistration:
+    """register() should wire ctx.register_hook for the two tool hooks
+    so Hermes' agent runtime fires them at dispatch boundaries."""
+
+    def test_register_wires_pre_tool_call_hook(self):
+        ctx = MagicMock()
+        register(ctx)
+        hook_names = [
+            call.args[0] if call.args else call.kwargs.get("hook_name")
+            for call in ctx.register_hook.call_args_list
+        ]
+        assert "pre_tool_call" in hook_names
+
+    def test_register_wires_post_tool_call_hook(self):
+        ctx = MagicMock()
+        register(ctx)
+        hook_names = [
+            call.args[0] if call.args else call.kwargs.get("hook_name")
+            for call in ctx.register_hook.call_args_list
+        ]
+        assert "post_tool_call" in hook_names
+
+    def test_register_survives_ctx_without_register_hook(self):
+        # Some stub ctxs (older Hermes, tests) don't expose register_hook.
+        # Platform registration must still succeed; event reporting is a
+        # bonus that's safe to skip.
+        ctx = MagicMock(spec=["register_platform", "register_tool"])
+        register(ctx)
+        ctx.register_platform.assert_called_once()
+
+
 class TestFreshRestClient:
     """Regression coverage for the cross-loop asyncio.Event poisoning.
 

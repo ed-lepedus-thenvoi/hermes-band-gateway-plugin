@@ -164,6 +164,13 @@ class BandAdapter(BasePlatformAdapter):
         self._room_last_sender: Dict[str, Dict[str, str]] = {}
         self._room_participants: Dict[str, List[Dict[str, Any]]] = {}
         self._room_meta: Dict[str, Dict[str, Any]] = {}
+        # Most-recently-active room — used by event reporting (tool_call /
+        # tool_result / error) to route debug events to the chat the user
+        # is currently looking at. Updated on every inbound.
+        self._last_active_room_id: Optional[str] = None
+        # Captured at connect() so sync Hermes hook callbacks can schedule
+        # async REST posts on the right loop via run_coroutine_threadsafe.
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
     @property
     def name(self) -> str:
@@ -204,6 +211,15 @@ class BandAdapter(BasePlatformAdapter):
             self._lock_key = None
 
         self._bridge = _BridgeAdapter(SimpleAdapter, hermes=self)
+
+        # Capture the gateway's main asyncio loop so sync Hermes hook
+        # callbacks (pre_tool_call / post_tool_call) can later schedule
+        # async event posts on it via run_coroutine_threadsafe — Hermes
+        # invokes hooks synchronously from a worker thread.
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._main_loop = None
 
         try:
             self._agent = Agent.create(
@@ -423,8 +439,29 @@ class BandAdapter(BasePlatformAdapter):
                 "handle": sender_handle,
             }
         self._room_meta.setdefault(room_id, {})["last_message_id"] = getattr(msg, "id", "")
+        # Track most-recently-active room for event-reporting routing.
+        self._last_active_room_id = room_id
 
     # --- Outbound ----------------------------------------------------------
+
+    async def _send_failure(
+        self,
+        chat_id: str,
+        reason: str,
+        **extra: Any,
+    ) -> SendResult:
+        """Build a failure ``SendResult`` AND post an ``error`` event to
+        the active room so the operator can see in chat what went wrong.
+
+        Best-effort: the event post is awaited (we're on the main loop
+        here) but never raises, so a follow-on failure can't shadow the
+        underlying SendResult error.
+        """
+        ev_room = chat_id or self._active_chat_id() or ""
+        if ev_room:
+            content, metadata = self._build_error_event(reason, **extra)
+            await self._post_band_event(ev_room, content, "error", metadata)
+        return SendResult(success=False, error=reason)
 
     async def send(
         self,
@@ -433,13 +470,34 @@ class BandAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        # Hermes lifecycle notices (retry/failure status callbacks) get
+        # rerouted to the Band ``error`` event channel rather than the
+        # chat-text channel. This stops "⏳ Retrying in 2.2s…" and
+        # "API call failed after 3 retries…" from appearing as messages
+        # other agents see and respond to.
+        if self._is_system_notice(content):
+            ev_chat = chat_id or self._active_chat_id() or ""
+            if ev_chat:
+                _, ev_meta = self._build_error_event(
+                    content.lstrip(), source="hermes_status_notice",
+                )
+                await self._post_band_event(
+                    ev_chat, content.lstrip(), "error", ev_meta,
+                )
+            # Return success so Hermes' status-delivery accounting keeps
+            # moving; from its POV the notice was delivered.
+            return SendResult(
+                success=True,
+                message_id=str(int(time.time() * 1000)),
+            )
+
         if not self._agent or not self.is_connected:
-            return SendResult(success=False, error="Not connected to Band")
+            return await self._send_failure(chat_id, "Not connected to Band")
 
         try:
             _Agent, _SimpleAdapter, AgentTools = _import_band_sdk()
         except ImportError as exc:
-            return SendResult(success=False, error=str(exc))
+            return await self._send_failure(chat_id, str(exc))
 
         # A fresh REST client per send avoids the cross-loop asyncio.Event
         # poisoning described on _new_rest_client. The agent's own
@@ -448,7 +506,9 @@ class BandAdapter(BasePlatformAdapter):
         try:
             rest = self._new_rest_client()
         except ImportError as exc:
-            return SendResult(success=False, error=f"Band SDK not importable: {exc}")
+            return await self._send_failure(
+                chat_id, f"Band SDK not importable: {exc}",
+            )
 
         participants = self._room_participants.get(chat_id) or []
 
@@ -502,20 +562,18 @@ class BandAdapter(BasePlatformAdapter):
             mentions = [m for m in mentions if m not in self_handles]
 
         if not mentions:
-            return SendResult(
-                success=False,
-                error=(
-                    "Band: cannot send to room — no known recipients. Send at "
-                    "least one inbound message in this room first, or use the "
-                    "send_message tool with explicit mentions."
-                ),
+            return await self._send_failure(
+                chat_id,
+                "Band: cannot send to room — no known recipients. Send at "
+                "least one inbound message in this room first, or use the "
+                "send_message tool with explicit mentions.",
             )
 
         try:
             response = await tools.send_message(content=content, mentions=mentions)
         except Exception as exc:
             logger.error("Band: send_message failed for room %s: %s", chat_id, exc)
-            return SendResult(success=False, error=str(exc))
+            return await self._send_failure(chat_id, str(exc))
 
         message_id = ""
         if response is not None:
@@ -619,6 +677,166 @@ class BandAdapter(BasePlatformAdapter):
                 _push(participant)
 
         return ordered_handles
+
+    # Hermes lifecycle-status notice prefixes. ``run_agent._emit_status``
+    # routes things like "⏳ Retrying in 2.2s (attempt 1/3)…" and
+    # "API call failed after 3 retries: …" through the same send() path
+    # as regular LLM replies. In a multi-agent Band room they show up
+    # as chat noise other agents see and sometimes respond to. We
+    # pattern-match the precise prefixes Hermes uses and route those
+    # through Band's ``error`` event channel instead (visible in the
+    # Events pane, not Text).
+    _SYSTEM_NOTICE_PATTERNS = (
+        re.compile(r"^⚠[️]?\s+\S+\s+stream drop", re.UNICODE),
+        re.compile(r"^⏳\s+Retrying\s+in\b", re.UNICODE),
+        re.compile(r"^API call failed after \d+ retr", re.UNICODE),
+        re.compile(r"^⚠[️]?\s*Operation interrupted: retrying", re.UNICODE),
+        re.compile(r"^❌\s+", re.UNICODE),
+        re.compile(r"^🛑\s+", re.UNICODE),
+    )
+
+    def _is_system_notice(self, content: str) -> bool:
+        """True if ``content`` matches a Hermes status-callback notice
+        that should be reported as a Band ``error`` event rather than a
+        plain chat message."""
+        if not content:
+            return False
+        head = content.lstrip()
+        return any(p.match(head) for p in self._SYSTEM_NOTICE_PATTERNS)
+
+    # ─── Visual debugging: tool_call / tool_result / error events ────────
+    #
+    # Band's chat UI renders typed events (tool_call, tool_result, error,
+    # thought, task) separately from plain text — toggleable in the
+    # "AVAILABLE EVENT TYPES" pane. We use this to surface what each agent
+    # is doing under the hood without polluting the conversation stream.
+    #
+    # The SDK's ``AgentTools.send_event`` helper has a Pydantic
+    # ``Literal["thought","error","task"]`` constraint that excludes the
+    # two most useful types here; the underlying ``ChatEventRequest``
+    # accepts all five. We post directly to the REST endpoint to bypass
+    # the helper.
+
+    _EVENT_RESULT_EXCERPT_MAX = 500
+
+    def _event_reporting_enabled(self) -> bool:
+        """Allow operators to silence event reporting with one env var."""
+        raw = os.getenv("HERMES_BAND_EVENT_REPORTING")
+        if raw is None:
+            return True
+        return _truthy(raw)
+
+    def _active_chat_id(self) -> Optional[str]:
+        """Most-recently-active room — used to route debug events to the
+        chat the user is currently looking at when an agent is in
+        multiple rooms."""
+        return self._last_active_room_id
+
+    def _build_tool_call_event(
+        self,
+        tool_name: str,
+        args: Any,
+        tool_call_id: str = "",
+    ) -> tuple:
+        """Pure: assemble the (content, metadata) for a tool_call event."""
+        content = f"⚙️  {tool_name}"
+        metadata = {
+            "tool_name": tool_name,
+            "args": args,
+            "tool_call_id": tool_call_id or "",
+        }
+        return content, metadata
+
+    def _build_tool_result_event(
+        self,
+        tool_name: str,
+        args: Any,
+        result: Any,
+        duration_ms: int = 0,
+        tool_call_id: str = "",
+    ) -> tuple:
+        """Pure: assemble the (content, metadata) for a tool_result event.
+
+        Result excerpt is bounded so a large tool output doesn't blow up
+        Band's event payload — full content stays in Hermes' transcript.
+        """
+        result_str = result if isinstance(result, str) else str(result)
+        if len(result_str) > self._EVENT_RESULT_EXCERPT_MAX:
+            result_str = result_str[: self._EVENT_RESULT_EXCERPT_MAX] + "…"
+        content = f"✓ {tool_name} ({duration_ms}ms)"
+        metadata = {
+            "tool_name": tool_name,
+            "result_excerpt": result_str,
+            "duration_ms": duration_ms,
+            "tool_call_id": tool_call_id or "",
+        }
+        return content, metadata
+
+    def _build_error_event(self, reason: str, **extra: Any) -> tuple:
+        content = f"❌ {reason}" if not reason.startswith("❌") else reason
+        metadata: Dict[str, Any] = {"reason": reason}
+        metadata.update({k: v for k, v in extra.items() if v is not None})
+        return content, metadata
+
+    async def _post_band_event(
+        self,
+        chat_id: str,
+        content: str,
+        message_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Fire-and-forget post of a chat event to Band.
+
+        Never raises — event reporting is best-effort. A failure here
+        must not break the actual tool dispatch or message send that
+        triggered it.
+        """
+        if not self._event_reporting_enabled() or not chat_id:
+            return
+        try:
+            from thenvoi.client.rest import (  # type: ignore
+                ChatEventRequest,
+                DEFAULT_REQUEST_OPTIONS,
+            )
+        except ImportError:
+            return
+        rest = self._new_rest_client()
+        try:
+            await rest.agent_api_events.create_agent_chat_event(
+                chat_id=chat_id,
+                event=ChatEventRequest(
+                    content=content,
+                    message_type=message_type,
+                    metadata=metadata or {},
+                ),
+                request_options=DEFAULT_REQUEST_OPTIONS,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Band: %s event post for room %s failed: %s",
+                message_type, chat_id, exc,
+            )
+
+    def _schedule_event_post(self, coro: Any) -> None:
+        """Schedule an async event-post coroutine on the main loop from a
+        sync Hermes hook callback. No-op if the main loop isn't captured
+        (pre-connect, tests)."""
+        loop = self._main_loop
+        if loop is None or not loop.is_running():
+            # Test / pre-connect path: drop the coroutine to avoid leaking.
+            try:
+                coro.close()
+            except Exception:
+                pass
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception as exc:
+            logger.debug("Band: could not schedule event post: %s", exc)
+            try:
+                coro.close()
+            except Exception:
+                pass
 
     def _install_mark_processed_recovery(self, link: Any) -> None:
         """Wrap ``link.mark_processed`` to recover from server-side 422s.
@@ -1401,6 +1619,55 @@ _BAND_TOOL_HANDLERS: Dict[str, Any] = {
 }
 
 
+def _register_event_reporting_hooks(ctx: Any) -> None:
+    """Wire Hermes pre/post tool hooks → Band chat events.
+
+    Posts are scheduled on the adapter's captured main loop and never
+    raise back into Hermes' dispatcher. If the host doesn't expose
+    ``register_hook`` (older Hermes versions, certain test ctxs), this
+    is a no-op — platform registration still succeeds.
+    """
+    register_hook = getattr(ctx, "register_hook", None)
+    if register_hook is None:
+        return
+
+    def _on_pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any) -> None:
+        adapter = _get_live_adapter()
+        if adapter is None:
+            return
+        chat_id = adapter._active_chat_id()
+        if not chat_id:
+            return
+        content, metadata = adapter._build_tool_call_event(
+            tool_name, args or {}, tool_call_id=str(kw.get("tool_call_id") or ""),
+        )
+        adapter._schedule_event_post(
+            adapter._post_band_event(chat_id, content, "tool_call", metadata)
+        )
+
+    def _on_post_tool_call(
+        tool_name: str = "", args: Any = None, result: Any = "",
+        duration_ms: int = 0, **kw: Any,
+    ) -> None:
+        adapter = _get_live_adapter()
+        if adapter is None:
+            return
+        chat_id = adapter._active_chat_id()
+        if not chat_id:
+            return
+        content, metadata = adapter._build_tool_result_event(
+            tool_name, args or {}, result,
+            duration_ms=int(duration_ms or 0),
+            tool_call_id=str(kw.get("tool_call_id") or ""),
+        )
+        adapter._schedule_event_post(
+            adapter._post_band_event(chat_id, content, "tool_result", metadata)
+        )
+
+    register_hook("pre_tool_call", _on_pre_tool_call)
+    register_hook("post_tool_call", _on_post_tool_call)
+
+
 def _register_band_tools(ctx: Any) -> None:
     """Expose Band-native platform tools to the Hermes LLM."""
     register_tool = getattr(ctx, "register_tool", None)
@@ -1469,3 +1736,4 @@ def register(ctx: Any) -> None:
         ),
     )
     _register_band_tools(ctx)
+    _register_event_reporting_hooks(ctx)
