@@ -6,3 +6,6 @@ __pycache__/
 .env.*
 .DS_Store
 .claude/
+
+# Team-internal field notes, not for the public repo.
+docs/retrospective.md
